@@ -3,6 +3,13 @@ from __future__ import annotations
 from fastapi import FastAPI, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
 from jarvis_contracts import (
+    ClientAction,
+    DeepThinkPlanRequest,
+    DeepThinkPlanResponse,
+    DeepThinkRequest,
+    DeepThinkResponse,
+    DeepThinkStepPayload,
+    DeepThinkStepResult,
     InternalConversationRequest,
     InternalConversationResponse,
     JarvisCoreEndpoints,
@@ -10,6 +17,12 @@ from jarvis_contracts import (
 
 from ai import AIService
 from ai.client import StubAIClient
+from application.deepthink import DeepThinkService
+from application.deepthink.schemas import (
+    DeepThinkInternalRequest,
+    DeepThinkPlanInternalRequest,
+    DeepThinkStepInput,
+)
 from application.chat.schemas import (
     ChatOnceRequest,
     ChatOnceResponse,
@@ -32,6 +45,10 @@ from middleware import RequestIDMiddleware
 
 def _get_chat_service(app: FastAPI) -> ChatService:
     return ChatService(db=app.state.db, ai_service=app.state.ai_service)
+
+
+def _get_deepthink_service(app: FastAPI) -> DeepThinkService:
+    return DeepThinkService(db=app.state.db, ai_service=app.state.ai_service)
 
 
 def create_app(db: DBClient | None = None, ai_service: AIService | None = None) -> FastAPI:
@@ -244,6 +261,90 @@ def create_app(db: DBClient | None = None, ai_service: AIService | None = None) 
         service = _get_chat_service(app)
         result = service.list_memory(user_id=x_user_id, chat_id=chat_id)
         return [MemoryResponse(**item) for item in result]
+
+    # ── internal: deepthink ────────────────────────────────
+
+    @app.post(
+        JarvisCoreEndpoints.INTERNAL_DEEPTHINK_PLAN.path,
+        response_model=DeepThinkPlanResponse,
+    )
+    async def deepthink_plan(
+        body: DeepThinkPlanRequest,
+        x_user_id: str = Header(...),
+        x_request_id: str = Header(default=""),
+    ) -> DeepThinkPlanResponse:
+        service = _get_deepthink_service(app)
+        internal_req = DeepThinkPlanInternalRequest(
+            request_id=body.request_id,
+            message=body.message,
+        )
+        result = await service.plan(internal_req, user_id=x_user_id)
+        return DeepThinkPlanResponse(
+            request_id=result.request_id,
+            goal=result.goal,
+            steps=[
+                DeepThinkStepPayload(
+                    id=s.id,
+                    title=s.title,
+                    description=s.description,
+                )
+                for s in result.steps
+            ],
+            constraints=result.constraints,
+        )
+
+    @app.post(
+        JarvisCoreEndpoints.INTERNAL_DEEPTHINK_EXECUTE.path,
+        response_model=DeepThinkResponse,
+    )
+    async def deepthink_execute(
+        body: DeepThinkRequest,
+        x_user_id: str = Header(...),
+        x_request_id: str = Header(default=""),
+    ) -> DeepThinkResponse:
+        service = _get_deepthink_service(app)
+        internal_req = DeepThinkInternalRequest(
+            request_id=body.request_id,
+            message=body.message,
+            plan_steps=[
+                DeepThinkStepInput(
+                    id=step.id,
+                    title=step.title,
+                    description=step.description,
+                )
+                for step in body.plan_steps
+            ],
+        )
+        result = await service.execute(internal_req, user_id=x_user_id)
+
+        def _to_client_action(a) -> ClientAction:
+            return ClientAction(
+                type=a.type,
+                command=a.command,
+                target=a.target,
+                payload=a.payload,
+                args=a.args,
+                description=a.description,
+                requires_confirm=a.requires_confirm,
+                step_id=a.step_id,
+            )
+
+        return DeepThinkResponse(
+            request_id=result.request_id,
+            steps=[
+                DeepThinkStepResult(
+                    step_id=s.step_id,
+                    title=s.title,
+                    status=s.status,
+                    content=s.content,
+                    actions=[_to_client_action(a) for a in s.actions],
+                )
+                for s in result.steps
+            ],
+            summary=result.summary,
+            content=result.content,
+            actions=[_to_client_action(a) for a in result.actions],
+        )
 
     return app
 

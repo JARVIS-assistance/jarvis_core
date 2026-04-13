@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncGenerator
 from uuid import uuid4
+
+logger = logging.getLogger("jarvis_core.chat")
 
 from fastapi import HTTPException, status
 from jarvis_contracts import ErrorResponse
@@ -47,6 +50,43 @@ from .schemas import (
 )
 
 
+# ── 베이스 시스템 프롬프트 ─────────────────────────────────
+# 페르소나보다 먼저 적용되는 JARVIS 핵심 정체성·규칙.
+# 모든 대화(realtime, deep)에서 항상 포함된다.
+# Workbench UI에서 수정 가능 (prompts.yaml → base_system 키).
+from core.config.prompt_loader import load_prompt as _load_prompt
+
+_BASE_SYSTEM_PROMPT_FALLBACK = """\
+You are JARVIS — an intelligent AI assistant system.
+
+## Core rules
+1. Always respond in the same language the user uses. If the user writes in Korean, respond in Korean. If English, respond in English.
+2. Be accurate. If you are unsure, say so honestly rather than guessing.
+3. Be concise but thorough. Avoid unnecessary filler, but include all relevant details.
+4. When the user asks you to do something (open apps, search, create files, etc.), focus on carrying out the action rather than explaining what you would do.
+5. Respect privacy. Never ask for sensitive personal information unless the user offers it.
+6. If a request is ambiguous, ask one clarifying question before proceeding.
+
+## Capabilities
+- General conversation and Q&A
+- Web search for real-time information (weather, news, prices, etc.)
+- Deep analysis and multi-step reasoning
+- Remote PC control: terminal commands, app launch, file operations, mouse/keyboard, screenshots
+- Planning and step-by-step task execution
+
+## Response style
+- Use markdown formatting when it improves readability (lists, bold, code blocks).
+- For simple questions, answer directly without unnecessary structure.
+- For complex tasks, break down into clear steps.
+"""
+
+
+def _get_base_system_prompt() -> str:
+    """prompts.yaml에서 base_system을 읽고, 없으면 fallback을 반환한다."""
+    loaded = _load_prompt("base_system")
+    return loaded if loaded else _BASE_SYSTEM_PROMPT_FALLBACK
+
+
 class ChatService:
     def __init__(self, db: DBClient, ai_service: AIService) -> None:
         self.db = db
@@ -87,12 +127,28 @@ class ChatService:
             if selected_model is not None and bool(
                 selected_model.get("is_active", True)
             ):
+                logger.info(
+                    "[chat] model selected purpose=%s provider=%s/%s model=%s config_id=%s user=%s",
+                    purpose,
+                    selected_model["provider_mode"],
+                    selected_model["provider_name"],
+                    selected_model["model_name"],
+                    selected_model["id"],
+                    user_id,
+                )
                 return selected_model
 
         config = get_active_model_for_user(self.db, user_id=user_id)
-        return config or {
-            **self._fallback_model_config(),
-        }
+        result = config or {**self._fallback_model_config()}
+        logger.info(
+            "[chat] model fallback purpose=%s provider=%s/%s model=%s user=%s",
+            purpose,
+            result.get("provider_mode"),
+            result.get("provider_name"),
+            result.get("model_name"),
+            user_id,
+        )
+        return result
 
     def _resolve_route(self, message: str, task_type: str, route_override: str | None) -> str:
         if route_override in {"realtime", "deep"}:
@@ -120,7 +176,8 @@ class ChatService:
             else "Respond with low latency and concise, directly useful guidance."
         )
         system_parts = [
-            persona["prompt_template"],
+            _get_base_system_prompt(),
+            f"## Persona\n{persona['prompt_template']}",
             f"Tone: {persona['tone'] or 'balanced'}",
             f"Route mode: {route}",
             f"User locale: {settings['locale']}",

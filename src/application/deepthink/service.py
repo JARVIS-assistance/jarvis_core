@@ -1,0 +1,486 @@
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any
+
+from ai import AIService
+from core.db.db_connection import DBClient
+from core.db.db_operations import (
+    get_active_model_for_user,
+    get_model_config_by_id_for_user,
+    get_user_ai_selection,
+)
+
+from core.config.prompt_loader import load_prompt as _load_prompt
+
+from .action_executor import ActionExecutor, ExecutionResult
+from .schemas import (
+    ClientActionInternal,
+    DeepThinkInternalRequest,
+    DeepThinkInternalResponse,
+    DeepThinkPlanInternalRequest,
+    DeepThinkPlanInternalResponse,
+    DeepThinkStepInput,
+    DeepThinkStepOutput,
+)
+
+logger = logging.getLogger("jarvis_core.deepthink")
+
+# ── AI system prompts ──────────────────────────────────────
+# Workbench UI에서 수정 가능 (prompts.yaml).
+# yaml에 값이 있으면 우선 사용, 없으면 아래 fallback 사용.
+
+_PLANNING_SYSTEM_PROMPT_FALLBACK = """\
+You are JARVIS deep-thinking planning engine.
+You control a remote user PC and can perform both logical tasks and physical control.
+
+Given a user request, produce a structured execution plan as JSON.
+
+You MUST respond with ONLY a JSON object (no markdown fences, no extra text) in this format:
+{
+  "goal": "one sentence describing the objective",
+  "constraints": ["constraint 1", "constraint 2"],
+  "steps": [
+    {"id": "s1", "title": "short title", "description": "what to do in this step"},
+    {"id": "s2", "title": "short title", "description": "what to do in this step"}
+  ]
+}
+
+Available capabilities for planning:
+- Logical: terminal commands, file create/read/write, app launch, web search, URL open, clipboard, notify
+- Physical: mouse click/drag, keyboard typing, hotkey combos, screenshot capture
+- Search: web search to retrieve real-time information (weather, news, stock prices, general knowledge, etc.)
+
+Planning rules:
+- 1~6 steps, each step must be concrete and actionable
+- Steps should be ordered by dependency
+- For **information/search requests** (weather, news, prices, general knowledge):
+  1. web_search step to retrieve the information
+  2. notify step to present the summarized result to the user
+  Keep it simple — usually 2 steps is enough.
+- For physical control tasks (GUI interaction), plan a screenshot step FIRST to understand the screen layout, then action steps based on coordinates
+- For logical tasks (file ops, terminal), no screenshot needed — execute directly
+- Include constraints the user mentioned or that are implied
+- Write in the same language as the user's request
+"""
+
+_EXECUTION_SYSTEM_PROMPT_FALLBACK = """\
+You are JARVIS deep-thinking execution engine controlling a remote user PC.
+You receive a plan step and must produce the concrete actions the client should perform.
+
+Include actions in a JSON array fenced with ```actions ... ```.
+
+## Action types
+
+### Logical actions (no screen needed)
+| type | command | target | payload | args |
+|------|---------|--------|---------|------|
+| terminal | shell command | null | null | {cwd, env, timeout} |
+| app_control | app name to launch | null | null | {} |
+| file_write | null | file path | full file content | {} |
+| file_read | null | file path | null | {} |
+| open_url | null | URL or file path | null | {} |
+| web_search | search query | null | null | {max_results: 3} |
+| clipboard | null | null | text to copy | {} |
+| notify | null | null | null | {} |
+
+### Physical control actions (screen interaction)
+| type | command | target | payload | args |
+|------|---------|--------|---------|------|
+| screenshot | null | null | null | {region: [x,y,w,h] or null} |
+| mouse_click | null | null | null | {x, y, button: "left", clicks: 1} |
+| mouse_drag | null | null | null | {start_x, start_y, end_x, end_y} |
+| keyboard_type | null | null | text to type | {enter: true} |
+| hotkey | key combo e.g. "ctrl,c" | null | null | {} |
+
+## Rules
+1. **Logical tasks** (terminal, file, app, search): execute directly, no screenshot needed.
+2. **Physical tasks** (GUI click, type in app): if coordinates are unknown, emit a `screenshot` action first. The next step will receive the screenshot result for coordinate analysis.
+3. **Search tasks**: emit `web_search` action. The server will execute the search and inject results into the next step's context automatically. Do NOT try to answer the question yourself — just emit the search action.
+4. `requires_confirm`: true for destructive operations (delete, overwrite, install). false for reads, screenshots, notifications, searches.
+5. `description`: human-readable explanation in the user's language.
+6. Your analysis text should come BEFORE the ```actions``` block.
+7. Respond in the same language as the user's request.
+
+## Examples
+
+Terminal command:
+```actions
+[{"type": "terminal", "command": "pip install requests", "target": null, "payload": null, "args": {"cwd": "/project"}, "description": "requests 패키지 설치", "requires_confirm": true}]
+```
+
+App launch + keyboard typing:
+```actions
+[
+  {"type": "app_control", "command": "notepad", "target": null, "payload": null, "args": {}, "description": "메모장 실행", "requires_confirm": false},
+  {"type": "keyboard_type", "command": null, "target": null, "payload": "Hello World", "args": {"enter": false}, "description": "메모장에 텍스트 입력", "requires_confirm": false}
+]
+```
+
+Screen analysis needed:
+```actions
+[{"type": "screenshot", "command": null, "target": null, "payload": null, "args": {}, "description": "현재 화면 캡처하여 좌표 파악", "requires_confirm": false}]
+```
+
+Click at coordinate:
+```actions
+[{"type": "mouse_click", "command": null, "target": null, "payload": null, "args": {"x": 500, "y": 300, "button": "left", "clicks": 1}, "description": "확인 버튼 클릭", "requires_confirm": false}]
+```
+
+Web search for information:
+```actions
+[{"type": "web_search", "command": "서울 날씨 오늘", "target": null, "payload": null, "args": {"max_results": 3}, "description": "서울 오늘 날씨 검색", "requires_confirm": false}]
+```
+
+Notify user with search results:
+```actions
+[{"type": "notify", "command": null, "target": null, "payload": "서울 현재 기온 18°C, 맑음, 미세먼지 보통", "args": {}, "description": "검색 결과를 사용자에게 알림", "requires_confirm": false}]
+```
+"""
+
+
+def _get_planning_prompt() -> str:
+    loaded = _load_prompt("deepthink_planning")
+    return loaded if loaded else _PLANNING_SYSTEM_PROMPT_FALLBACK
+
+
+def _get_execution_prompt() -> str:
+    loaded = _load_prompt("deepthink_execution")
+    return loaded if loaded else _EXECUTION_SYSTEM_PROMPT_FALLBACK
+
+
+def _get_summarize_prompt() -> str:
+    loaded = _load_prompt("deepthink_summarize")
+    return loaded if loaded else (
+        "You are JARVIS. "
+        "Summarize the search results concisely "
+        "and answer the user's question directly. "
+        "Respond in the same language as the user's request. "
+        "Do NOT include action blocks."
+    )
+
+
+def _parse_actions_from_content(
+    content: str, step_id: str | None = None
+) -> list[ClientActionInternal]:
+    """AI 응답에서 ```actions ... ``` JSON 블록을 파싱한다."""
+    pattern = r"```actions\s*\n(.*?)```"
+    matches = re.findall(pattern, content, re.DOTALL)
+    actions: list[ClientActionInternal] = []
+    for match in matches:
+        try:
+            raw_list = json.loads(match.strip())
+            if not isinstance(raw_list, list):
+                raw_list = [raw_list]
+            for item in raw_list:
+                item.setdefault("step_id", step_id)
+                actions.append(ClientActionInternal.model_validate(item))
+        except (json.JSONDecodeError, Exception) as exc:
+            logger.warning("failed to parse actions block: %s", exc)
+    return actions
+
+
+def _parse_plan_json(raw: str) -> dict[str, Any]:
+    """AI의 플랜 응답에서 JSON을 추출한다.
+
+    AI가 ```json 블록으로 감싸거나 순수 JSON으로 응답하는 경우 모두 처리.
+    """
+    # try extracting from code fence first
+    fence_match = re.search(r"```(?:json)?\s*\n(.*?)```", raw, re.DOTALL)
+    if fence_match:
+        return json.loads(fence_match.group(1).strip())
+
+    # try parsing raw as JSON
+    stripped = raw.strip()
+    if stripped.startswith("{"):
+        return json.loads(stripped)
+
+    raise ValueError(f"cannot parse plan JSON from AI response: {raw[:200]}")
+
+
+class DeepThinkService:
+    def __init__(self, db: DBClient, ai_service: AIService) -> None:
+        self.db = db
+        self.ai_service = ai_service
+        self.action_executor = ActionExecutor()
+
+    def _select_deep_model(self, user_id: str) -> dict[str, Any]:
+        """user_ai_model_selection.deep_model_config_id를 우선 사용한다."""
+        selection = get_user_ai_selection(self.db, user_id=user_id)
+        if selection is not None:
+            deep_id = selection.get("deep_model_config_id")
+            if deep_id:
+                model = get_model_config_by_id_for_user(
+                    self.db, user_id=user_id, model_config_id=deep_id
+                )
+                if model is not None and bool(model.get("is_active", True)):
+                    logger.info(
+                        "[deepthink] model selected via user deep_model_config_id "
+                        "provider=%s/%s model=%s config_id=%s user=%s",
+                        model["provider_mode"], model["provider_name"],
+                        model["model_name"], model["id"], user_id,
+                    )
+                    return model
+
+        config = get_active_model_for_user(self.db, user_id=user_id)
+        if config is not None:
+            logger.info(
+                "[deepthink] model selected via active default "
+                "provider=%s/%s model=%s config_id=%s user=%s",
+                config["provider_mode"], config["provider_name"],
+                config["model_name"], config["id"], user_id,
+            )
+            return config
+
+        logger.warning(
+            "[deepthink] no model configured, using local-stub fallback user=%s",
+            user_id,
+        )
+        return {
+            "id": "default-deep",
+            "provider_mode": "local",
+            "provider_name": "local-default",
+            "model_name": "local-stub",
+            "api_key": None,
+            "endpoint": None,
+        }
+
+    def _build_ai_request(
+        self,
+        model: dict[str, Any],
+        system_prompt: str,
+        user_message: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "message": user_message,
+            "route": "deep",
+            "request_id": request_id,
+            "provider_mode": model["provider_mode"],
+            "provider_name": model["provider_name"],
+            "model_name": model["model_name"],
+            "api_key": model.get("api_key"),
+            "endpoint": model.get("endpoint"),
+            "system_prompt": system_prompt,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+        }
+
+    # ── AI 기반 플래닝 ─────────────────────────────────────
+
+    async def plan(
+        self,
+        body: DeepThinkPlanInternalRequest,
+        user_id: str,
+    ) -> DeepThinkPlanInternalResponse:
+        """AI deep model을 사용해서 실행 플랜을 생성한다."""
+        model = self._select_deep_model(user_id)
+        logger.info(
+            "deepthink plan request_id=%s model=%s/%s",
+            body.request_id,
+            model["provider_name"],
+            model["model_name"],
+        )
+
+        ai_result = await self.ai_service.respond_once(
+            self._build_ai_request(
+                model=model,
+                system_prompt=_get_planning_prompt(),
+                user_message=body.message,
+                request_id=body.request_id,
+            )
+        )
+
+        try:
+            plan_data = _parse_plan_json(ai_result["content"])
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.error("failed to parse AI plan: %s", exc)
+            # fallback: 단일 스텝 플랜
+            return DeepThinkPlanInternalResponse(
+                request_id=body.request_id,
+                goal=body.message,
+                steps=[
+                    DeepThinkStepInput(
+                        id="s1",
+                        title="요청 처리",
+                        description=body.message,
+                    )
+                ],
+                constraints=[],
+            )
+
+        steps = [
+            DeepThinkStepInput(
+                id=step.get("id", f"s{idx}"),
+                title=step.get("title", f"Step {idx}"),
+                description=step.get("description", ""),
+            )
+            for idx, step in enumerate(plan_data.get("steps", []), start=1)
+        ]
+
+        return DeepThinkPlanInternalResponse(
+            request_id=body.request_id,
+            goal=plan_data.get("goal", body.message),
+            steps=steps,
+            constraints=plan_data.get("constraints", []),
+        )
+
+    # ── AI 기반 실행 ───────────────────────────────────────
+
+    # SUMMARIZE 프롬프트도 yaml에서 로드
+
+    async def execute(
+        self,
+        body: DeepThinkInternalRequest,
+        user_id: str,
+    ) -> DeepThinkInternalResponse:
+        """플래닝 단계를 순차적으로 AI에게 실행시키고, 각 단계에서 action을 추출한다.
+
+        ActionExecutor가 서버 실행 가능한 액션(web_search 등)을 직접 처리하고,
+        결과를 다음 단계 컨텍스트에 주입한다.
+        클라이언트 실행 액션(terminal, mouse 등)은 response.actions로 반환한다.
+        """
+        model = self._select_deep_model(user_id)
+        logger.info(
+            "deepthink execute request_id=%s model=%s/%s steps=%d",
+            body.request_id,
+            model["provider_name"],
+            model["model_name"],
+            len(body.plan_steps),
+        )
+
+        step_results: list[DeepThinkStepOutput] = []
+        all_client_actions: list[ClientActionInternal] = []
+        accumulated_context: list[str] = []
+
+        for step in body.plan_steps:
+            step_prompt = (
+                f"[현재 단계: {step.title}]\n"
+                f"원래 요청: {body.message}\n"
+                f"이 단계의 목표: {step.description}\n"
+            )
+            if accumulated_context:
+                step_prompt += (
+                    "\n이전 단계 결과:\n"
+                    + "\n".join(accumulated_context)
+                    + "\n"
+                )
+
+            try:
+                # 1) AI가 이 단계에서 필요한 액션을 생성
+                ai_result = await self.ai_service.respond_once(
+                    self._build_ai_request(
+                        model=model,
+                        system_prompt=_get_execution_prompt(),
+                        user_message=step_prompt,
+                        request_id=body.request_id,
+                    )
+                )
+                step_content = ai_result["content"]
+                step_actions = _parse_actions_from_content(
+                    step_content, step_id=step.id
+                )
+
+                # 2) ActionExecutor가 분류·실행
+                exec_result: ExecutionResult = (
+                    await self.action_executor.execute(step_actions)
+                )
+
+                # 3) 서버 실행 결과가 있으면 컨텍스트에 주입
+                if exec_result.has_server_results:
+                    accumulated_context.append(
+                        exec_result.get_server_context()
+                    )
+
+                    # 검색 결과 → AI에게 요약 요청
+                    search_text = exec_result.get_search_results_text()
+                    if search_text:
+                        step_content = await self._summarize_search(
+                            model=model,
+                            original_request=body.message,
+                            search_results=search_text,
+                            request_id=body.request_id,
+                        )
+
+                step_results.append(
+                    DeepThinkStepOutput(
+                        step_id=step.id,
+                        title=step.title,
+                        status="completed",
+                        content=step_content,
+                        actions=exec_result.client_actions,
+                    )
+                )
+                all_client_actions.extend(exec_result.client_actions)
+                accumulated_context.append(
+                    f"- {step.title}: {step_content[:500]}"
+                )
+
+            except Exception as exc:
+                logger.error(
+                    "deepthink step failed step_id=%s error=%s",
+                    step.id,
+                    exc,
+                )
+                step_results.append(
+                    DeepThinkStepOutput(
+                        step_id=step.id,
+                        title=step.title,
+                        status="failed",
+                        content=f"단계 실행 실패: {exc}",
+                        actions=[
+                            ClientActionInternal(
+                                type="notify",
+                                description=f"단계 '{step.title}' 실행 실패: {exc}",
+                                requires_confirm=False,
+                                step_id=step.id,
+                            )
+                        ],
+                    )
+                )
+
+        completed = [s for s in step_results if s.status == "completed"]
+        summary = (
+            f"{len(completed)}/{len(step_results)} 단계 완료. "
+            + "; ".join(s.title for s in completed)
+        )
+        content = "\n\n".join(
+            f"### {s.title}\n{s.content}" for s in step_results
+        )
+
+        return DeepThinkInternalResponse(
+            request_id=body.request_id,
+            steps=step_results,
+            summary=summary,
+            content=content,
+            actions=all_client_actions,
+        )
+
+    async def _summarize_search(
+        self,
+        *,
+        model: dict[str, Any],
+        original_request: str,
+        search_results: str,
+        request_id: str,
+    ) -> str:
+        """검색 결과를 AI에게 요약시켜 사용자 답변을 생성한다."""
+        summary_prompt = (
+            f"원래 요청: {original_request}\n\n"
+            f"아래는 웹 검색 결과입니다. "
+            f"사용자의 요청에 맞게 검색 결과를 요약해서 답변해주세요.\n\n"
+            f"검색 결과:\n{search_results}"
+        )
+        result = await self.ai_service.respond_once(
+            self._build_ai_request(
+                model=model,
+                system_prompt=_get_summarize_prompt(),
+                user_message=summary_prompt,
+                request_id=request_id,
+            )
+        )
+        return result["content"]
