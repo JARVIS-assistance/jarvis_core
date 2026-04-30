@@ -53,7 +53,10 @@ async def web_search(
 
 def _sync_search(query: str, max_results: int) -> list[dict]:
     """동기 함수 — executor에서 실행된다."""
-    from ddgs import DDGS
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        from duckduckgo_search import DDGS
 
     with DDGS() as ddgs:
         return list(ddgs.text(query, max_results=max_results))

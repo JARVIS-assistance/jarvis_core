@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import FastAPI, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
 from jarvis_contracts import (
@@ -41,6 +43,8 @@ from core.db.db_connection import DBClient, connect
 from core.db.db_schema import init_db
 from jarvis_core import available_modes, run_deep_thinking, run_realtime_conversation
 from middleware import RequestIDMiddleware
+
+logging.basicConfig(level=logging.INFO)
 
 
 def _get_chat_service(app: FastAPI) -> ChatService:
@@ -314,6 +318,7 @@ def create_app(db: DBClient | None = None, ai_service: AIService | None = None) 
                 )
                 for step in body.plan_steps
             ],
+            execution_context=body.execution_context,
         )
         result = await service.execute(internal_req, user_id=x_user_id)
 

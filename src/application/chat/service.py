@@ -66,6 +66,8 @@ You are JARVIS — an intelligent AI assistant system.
 4. When the user asks you to do something (open apps, search, create files, etc.), focus on carrying out the action rather than explaining what you would do.
 5. Respect privacy. Never ask for sensitive personal information unless the user offers it.
 6. If a request is ambiguous, ask one clarifying question before proceeding.
+7. Do not emit ```actions blocks or JSON action blocks in normal chat responses. Client actions are created by the Controller action registry path.
+8. Never invent action types. App launch is `type=app_control`, `command=open`, `target=<app name>`; never use `launch_app`.
 
 ## Capabilities
 - General conversation and Q&A
@@ -85,6 +87,35 @@ def _get_base_system_prompt() -> str:
     """prompts.yaml에서 base_system을 읽고, 없으면 fallback을 반환한다."""
     loaded = _load_prompt("base_system")
     return loaded if loaded else _BASE_SYSTEM_PROMPT_FALLBACK
+
+
+def _build_alternating_messages(
+    *,
+    system_prompt: str | None,
+    context_messages: list[dict[str, str]],
+    user_message: str,
+) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+
+    for message in context_messages:
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"user", "assistant"} or not content:
+            continue
+        if len(messages) == 1 and messages[0]["role"] == "system" and role == "assistant":
+            continue
+        if messages and messages[-1]["role"] == role:
+            messages[-1]["content"] += f"\n\n{content}"
+        else:
+            messages.append({"role": role, "content": content})
+
+    if messages and messages[-1]["role"] == "user":
+        messages[-1]["content"] += f"\n\n{user_message}"
+    else:
+        messages.append({"role": "user", "content": user_message})
+    return messages
 
 
 class ChatService:
@@ -112,6 +143,19 @@ class ChatService:
     def _select_model_config(
         self, user_id: str, purpose: str
     ) -> dict[str, str | bool | None]:
+        default_config = get_active_model_for_user(self.db, user_id=user_id)
+        if default_config is not None and bool(default_config.get("is_default", False)):
+            logger.info(
+                "[chat] model selected via default purpose=%s provider=%s/%s model=%s config_id=%s user=%s",
+                purpose,
+                default_config["provider_mode"],
+                default_config["provider_name"],
+                default_config["model_name"],
+                default_config["id"],
+                user_id,
+            )
+            return default_config
+
         selected_id: str | None = None
         selection = get_user_ai_selection(self.db, user_id=user_id)
         if selection is not None:
@@ -138,8 +182,7 @@ class ChatService:
                 )
                 return selected_model
 
-        config = get_active_model_for_user(self.db, user_id=user_id)
-        result = config or {**self._fallback_model_config()}
+        result = default_config or {**self._fallback_model_config()}
         logger.info(
             "[chat] model fallback purpose=%s provider=%s/%s model=%s user=%s",
             purpose,
@@ -238,10 +281,11 @@ class ChatService:
                 "api_key": selected.get("api_key"),
                 "endpoint": selected.get("endpoint"),
                 "system_prompt": system_prompt,
-                "messages": [
-                    *prompt_messages,
-                    {"role": "user", "content": body.message},
-                ],
+                "messages": _build_alternating_messages(
+                    system_prompt=system_prompt,
+                    context_messages=prompt_messages[1:],
+                    user_message=body.message,
+                ),
             }
         )
         add_message(self.db, session_id, "assistant", ai_result["content"])
@@ -444,10 +488,11 @@ class ChatService:
                     "api_key": selected.get("api_key"),
                     "endpoint": selected.get("endpoint"),
                     "system_prompt": system_prompt,
-                    "messages": [
-                        *prompt_messages,
-                        {"role": "user", "content": content},
-                    ],
+                    "messages": _build_alternating_messages(
+                        system_prompt=system_prompt,
+                        context_messages=prompt_messages[1:],
+                        user_message=content,
+                    ),
                 }
                 active_request = request_payload
 
@@ -496,6 +541,12 @@ class ChatService:
         email: str,
     ) -> AsyncGenerator[str, None]:
         """SSE 스트리밍: AI 제공자에서 토큰을 받아 SSE 이벤트로 yield."""
+        logger.info(
+            "[chat] stream start request_id=%s user=%s message=%s",
+            request_id,
+            user_id,
+            message[:200],
+        )
         if not user_id:
             yield f"event: error\ndata: {json.dumps({'content': 'missing user id'})}\n\n"
             return
@@ -505,18 +556,30 @@ class ChatService:
             yield f"event: error\ndata: {json.dumps({'content': reason or 'blocked'})}\n\n"
             return
 
-        session = get_or_create_session_for_user(
-            self.db, user_id=user_id, email=email or "unknown@local.jarvis"
-        )
-        session_id = session["id"]
-        route = self._resolve_route(message, task_type, route_override)
-        system_prompt, prompt_messages = self._build_prompt_context(
-            user_id=user_id, chat_id=session_id, route=route
-        )
-        add_message(self.db, session_id, "user", message)
+        try:
+            session = get_or_create_session_for_user(
+                self.db, user_id=user_id, email=email or "unknown@local.jarvis"
+            )
+            session_id = session["id"]
+            route = self._resolve_route(message, task_type, route_override)
+            logger.info(
+                "[chat] stream context start request_id=%s route=%s session=%s",
+                request_id,
+                route,
+                session_id,
+            )
+            system_prompt, prompt_messages = self._build_prompt_context(
+                user_id=user_id, chat_id=session_id, route=route
+            )
+            logger.info("[chat] stream context ready request_id=%s", request_id)
+            add_message(self.db, session_id, "user", message)
 
-        purpose = "deep" if route == "deep" else "realtime"
-        selected = self._select_model_config(user_id=user_id, purpose=purpose)
+            purpose = "deep" if route == "deep" else "realtime"
+            selected = self._select_model_config(user_id=user_id, purpose=purpose)
+        except Exception as exc:
+            logger.exception("[chat] stream setup failed request_id=%s", request_id)
+            yield f"event: error\ndata: {json.dumps({'request_id': request_id, 'content': f'stream setup failed: {exc}'})}\n\n"
+            return
 
         if not bool(selected.get("supports_stream", False)):
             yield f"event: error\ndata: {json.dumps({'content': 'selected model does not support streaming'})}\n\n"
@@ -532,10 +595,11 @@ class ChatService:
             "api_key": selected.get("api_key"),
             "endpoint": selected.get("endpoint"),
             "system_prompt": system_prompt,
-            "messages": [
-                *prompt_messages,
-                {"role": "user", "content": message},
-            ],
+            "messages": _build_alternating_messages(
+                system_prompt=system_prompt,
+                context_messages=prompt_messages[1:],
+                user_message=message,
+            ),
         }
 
         # meta event
@@ -573,7 +637,7 @@ class ChatService:
     def create_model_config(
         self, user_id: str, body: ModelConfigUpsertRequest
     ) -> dict[str, str | bool | None]:
-        return create_user_model_config(
+        result = create_user_model_config(
             self.db,
             user_id=user_id,
             provider_mode=body.provider_mode,
@@ -588,6 +652,14 @@ class ChatService:
             input_modalities=body.input_modalities,
             output_modalities=body.output_modalities,
         )
+        if body.is_default:
+            set_user_ai_selection(
+                self.db,
+                user_id=user_id,
+                realtime_model_config_id=str(result["id"]),
+                deep_model_config_id=str(result["id"]),
+            )
+        return result
 
     def list_model_configs(self, user_id: str) -> list[dict[str, str | bool | None]]:
         return list_user_model_configs(self.db, user_id=user_id)
@@ -616,6 +688,13 @@ class ChatService:
         )
         if result is None:
             raise HTTPException(status_code=404, detail="model config not found")
+        if body.is_default:
+            set_user_ai_selection(
+                self.db,
+                user_id=user_id,
+                realtime_model_config_id=str(result["id"]),
+                deep_model_config_id=str(result["id"]),
+            )
         return result
 
     def set_model_selection(

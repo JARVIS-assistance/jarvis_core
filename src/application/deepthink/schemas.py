@@ -4,6 +4,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from jarvis_contracts import ClientActionType
+
 
 class DeepThinkStepInput(BaseModel):
     id: str
@@ -12,11 +14,7 @@ class DeepThinkStepInput(BaseModel):
 
 
 class ClientActionInternal(BaseModel):
-    type: Literal[
-        "terminal", "app_control", "file_write", "file_read",
-        "open_url", "web_search", "notify", "clipboard",
-        "mouse_click", "mouse_drag", "keyboard_type", "hotkey", "screenshot",
-    ]
+    type: ClientActionType
     command: Optional[str] = None
     target: Optional[str] = None
     payload: Optional[str] = None
@@ -50,6 +48,7 @@ class DeepThinkInternalRequest(BaseModel):
     request_id: str
     message: str = Field(..., min_length=1)
     plan_steps: list[DeepThinkStepInput] = Field(default_factory=list)
+    execution_context: list[str] = Field(default_factory=list)
 
 
 class DeepThinkInternalResponse(BaseModel):

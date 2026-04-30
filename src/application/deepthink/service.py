@@ -6,11 +6,20 @@ import re
 from typing import Any
 
 from ai import AIService
+from jarvis_contracts import normalize_action_payload
 from core.db.db_connection import DBClient
 from core.db.db_operations import (
+    add_message,
+    ensure_default_persona_for_user,
+    ensure_user_settings,
     get_active_model_for_user,
+    get_latest_chat_summary,
     get_model_config_by_id_for_user,
+    get_or_create_session_for_user,
+    get_selected_persona_for_user,
     get_user_ai_selection,
+    list_memory_items,
+    list_recent_messages,
 )
 
 from core.config.prompt_loader import load_prompt as _load_prompt
@@ -82,6 +91,7 @@ Include actions in a JSON array fenced with ```actions ... ```.
 | file_write | null | file path | full file content | {} |
 | file_read | null | file path | null | {} |
 | open_url | null | URL or file path | null | {} |
+| browser_control | scroll/back/forward/reload/extract_dom/click_element/type_element/select_result | active_tab | optional text | browser args |
 | web_search | search query | null | null | {max_results: 3} |
 | clipboard | null | null | text to copy | {} |
 | notify | null | null | null | {} |
@@ -97,12 +107,15 @@ Include actions in a JSON array fenced with ```actions ... ```.
 
 ## Rules
 1. **Logical tasks** (terminal, file, app, search): execute directly, no screenshot needed.
-2. **Physical tasks** (GUI click, type in app): if coordinates are unknown, emit a `screenshot` action first. The next step will receive the screenshot result for coordinate analysis.
-3. **Search tasks**: emit `web_search` action. The server will execute the search and inject results into the next step's context automatically. Do NOT try to answer the question yourself — just emit the search action.
-4. `requires_confirm`: true for destructive operations (delete, overwrite, install). false for reads, screenshots, notifications, searches.
-5. `description`: human-readable explanation in the user's language.
-6. Your analysis text should come BEFORE the ```actions``` block.
-7. Respond in the same language as the user's request.
+2. **Web page tasks**: if clicking or typing inside the current page is needed, emit `browser_control` command `extract_dom` first. Use `click_element` or `type_element` only after DOM results provide an `ai_id`.
+3. **Physical tasks** (GUI click, type in app): if coordinates are unknown and DOM control is not applicable, emit a `screenshot` action first. The next step will receive the screenshot result for coordinate analysis.
+4. **Search tasks**: emit `web_search` action. The server will execute the search and inject results into the next step's context automatically. Do NOT try to answer the question yourself — just emit the search action.
+5. `requires_confirm`: true for destructive operations (delete, overwrite, install). false for reads, screenshots, notifications, searches.
+6. `description`: human-readable explanation in the user's language.
+7. Your analysis text should come BEFORE the ```actions``` block.
+8. Respond in the same language as the user's request.
+9. Use only canonical action types from the Client Action Registry. For app launch use `app_control` with `command=open` and `target=<app name>`. Never use `launch_app`.
+10. If the user refers to a result/link/button on the current browser page, emit `browser_control/extract_dom` first. Do not emit `web_search` or open a new search page for current-page selection.
 
 ## Examples
 
@@ -132,6 +145,26 @@ Click at coordinate:
 Web search for information:
 ```actions
 [{"type": "web_search", "command": "서울 날씨 오늘", "target": null, "payload": null, "args": {"max_results": 3}, "description": "서울 오늘 날씨 검색", "requires_confirm": false}]
+```
+
+Browser scroll:
+```actions
+[{"type": "browser_control", "command": "scroll", "target": "active_tab", "payload": null, "args": {"direction": "down", "amount": "page"}, "description": "브라우저 스크롤", "requires_confirm": false}]
+```
+
+Select search result:
+```actions
+[{"type": "browser_control", "command": "select_result", "target": "active_tab", "payload": null, "args": {"index": 2}, "description": "검색 결과에서 두 번째 항목 선택", "requires_confirm": false}]
+```
+
+Extract DOM to open a link:
+```actions
+[{"type": "browser_control", "command": "extract_dom", "target": "active_tab", "payload": null, "args": {"purpose": "resolve_open_request", "query": "초간단 마카롱 만들기", "include_links": true, "include_elements": true, "max_links": 120}, "description": "현재 페이지에서 초간단 마카롱 만들기 링크 후보 추출", "requires_confirm": false}]
+```
+
+Type into a page field after DOM target is known:
+```actions
+[{"type": "browser_control", "command": "type_element", "target": "active_tab", "payload": "마카롱", "args": {"ai_id": 3, "enter": false}, "description": "검색 입력란에 마카롱 입력", "requires_confirm": false}]
 ```
 
 Notify user with search results:
@@ -165,8 +198,12 @@ def _get_summarize_prompt() -> str:
 def _parse_actions_from_content(
     content: str, step_id: str | None = None
 ) -> list[ClientActionInternal]:
-    """AI 응답에서 ```actions ... ``` JSON 블록을 파싱한다."""
-    pattern = r"```actions\s*\n(.*?)```"
+    """AI 응답에서 action JSON 블록을 파싱한다.
+
+    The prompt asks for ```actions, but some providers still emit ```json.
+    Accept both when the JSON payload is an action object or action array.
+    """
+    pattern = r"```(?:actions|json)\s*\n(.*?)```"
     matches = re.findall(pattern, content, re.DOTALL)
     actions: list[ClientActionInternal] = []
     for match in matches:
@@ -175,8 +212,11 @@ def _parse_actions_from_content(
             if not isinstance(raw_list, list):
                 raw_list = [raw_list]
             for item in raw_list:
-                item.setdefault("step_id", step_id)
-                actions.append(ClientActionInternal.model_validate(item))
+                if not isinstance(item, dict) or "type" not in item:
+                    continue
+                normalized = normalize_action_payload(item)
+                normalized.setdefault("step_id", step_id)
+                actions.append(ClientActionInternal.model_validate(normalized))
         except (json.JSONDecodeError, Exception) as exc:
             logger.warning("failed to parse actions block: %s", exc)
     return actions
@@ -200,6 +240,125 @@ def _parse_plan_json(raw: str) -> dict[str, Any]:
     raise ValueError(f"cannot parse plan JSON from AI response: {raw[:200]}")
 
 
+def _coerce_plan_steps(plan_data: Any) -> list[dict[str, Any]]:
+    if isinstance(plan_data, dict):
+        raw_steps = plan_data.get("steps", [])
+    elif isinstance(plan_data, list):
+        raw_steps = plan_data
+    else:
+        raw_steps = []
+
+    steps: list[dict[str, Any]] = []
+    for idx, item in enumerate(raw_steps, start=1):
+        if isinstance(item, dict):
+            if "type" in item and "title" not in item:
+                steps.append(
+                    {
+                        "id": item.get("step_id") or f"s{idx}",
+                        "title": item.get("description") or item["type"],
+                        "description": json.dumps(item, ensure_ascii=False),
+                    }
+                )
+            else:
+                steps.append(item)
+        elif isinstance(item, str):
+            steps.append({"id": f"s{idx}", "title": item, "description": item})
+    return steps
+
+
+def _fallback_actions_from_step(
+    *,
+    message: str,
+    step: DeepThinkStepInput,
+) -> list[ClientActionInternal]:
+    text = f"{message}\n{step.title}\n{step.description}".lower()
+    result_index = _extract_result_index(text)
+    if result_index is not None and any(
+        token in text
+        for token in (
+            "선택",
+            "클릭",
+            "들어가",
+            "열어",
+            "open",
+            "click",
+            "select",
+        )
+    ):
+        return [
+            ClientActionInternal(
+                type="browser_control",
+                command="select_result",
+                target="active_tab",
+                args={"index": result_index},
+                description=f"현재 브라우저 검색 결과에서 {result_index}번째 항목 선택",
+                requires_confirm=False,
+                step_id=step.id,
+            )
+        ]
+
+    if (
+        "scroll" in text
+        or "스크롤" in text
+        or "내려" in text
+        or "아래" in text
+        or "page down" in text
+    ):
+        return [
+            ClientActionInternal(
+                type="browser_control",
+                command="scroll",
+                target="active_tab",
+                args={"direction": "down", "amount": "page"},
+                description="현재 브라우저 페이지를 아래로 스크롤",
+                requires_confirm=False,
+                step_id=step.id,
+            )
+        ]
+    return []
+
+
+def _extract_result_index(text: str) -> int | None:
+    ordinal_words = {
+        "첫번째": 1,
+        "첫 번째": 1,
+        "첫째": 1,
+        "1번째": 1,
+        "1번": 1,
+        "두번째": 2,
+        "두 번째": 2,
+        "둘째": 2,
+        "2번째": 2,
+        "2번": 2,
+        "세번째": 3,
+        "세 번째": 3,
+        "셋째": 3,
+        "3번째": 3,
+        "3번": 3,
+        "네번째": 4,
+        "네 번째": 4,
+        "넷째": 4,
+        "4번째": 4,
+        "4번": 4,
+        "다섯번째": 5,
+        "다섯 번째": 5,
+        "5번째": 5,
+        "5번": 5,
+        "first": 1,
+        "second": 2,
+        "third": 3,
+        "fourth": 4,
+        "fifth": 5,
+    }
+    for token, index in ordinal_words.items():
+        if token in text:
+            return index
+    match = re.search(r"\b([1-9])\s*(?:st|nd|rd|th|번째|번)\b", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
 class DeepThinkService:
     def __init__(self, db: DBClient, ai_service: AIService) -> None:
         self.db = db
@@ -207,7 +366,17 @@ class DeepThinkService:
         self.action_executor = ActionExecutor()
 
     def _select_deep_model(self, user_id: str) -> dict[str, Any]:
-        """user_ai_model_selection.deep_model_config_id를 우선 사용한다."""
+        """Use the active default model first, then fall back to deep selection."""
+        config = get_active_model_for_user(self.db, user_id=user_id)
+        if config is not None and bool(config.get("is_default", False)):
+            logger.info(
+                "[deepthink] model selected via default "
+                "provider=%s/%s model=%s config_id=%s user=%s",
+                config["provider_mode"], config["provider_name"],
+                config["model_name"], config["id"], user_id,
+            )
+            return config
+
         selection = get_user_ai_selection(self.db, user_id=user_id)
         if selection is not None:
             deep_id = selection.get("deep_model_config_id")
@@ -224,10 +393,9 @@ class DeepThinkService:
                     )
                     return model
 
-        config = get_active_model_for_user(self.db, user_id=user_id)
         if config is not None:
             logger.info(
-                "[deepthink] model selected via active default "
+                "[deepthink] model selected via active model "
                 "provider=%s/%s model=%s config_id=%s user=%s",
                 config["provider_mode"], config["provider_name"],
                 config["model_name"], config["id"], user_id,
@@ -253,7 +421,26 @@ class DeepThinkService:
         system_prompt: str,
         user_message: str,
         request_id: str,
+        context_messages: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
+        messages = [{"role": "system", "content": system_prompt}]
+        for message in context_messages or []:
+            role = message.get("role")
+            content = message.get("content")
+            if role not in {"user", "assistant"} or not content:
+                continue
+            if len(messages) == 1 and role == "assistant":
+                continue
+            if messages[-1]["role"] == role:
+                messages[-1]["content"] += f"\n\n{content}"
+            else:
+                messages.append({"role": role, "content": content})
+
+        if messages[-1]["role"] == "user":
+            messages[-1]["content"] += f"\n\n{user_message}"
+        else:
+            messages.append({"role": "user", "content": user_message})
+
         return {
             "message": user_message,
             "route": "deep",
@@ -264,11 +451,72 @@ class DeepThinkService:
             "api_key": model.get("api_key"),
             "endpoint": model.get("endpoint"),
             "system_prompt": system_prompt,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
+            "messages": messages,
         }
+
+    def _get_chat_session_id(self, user_id: str) -> str:
+        session = get_or_create_session_for_user(
+            self.db,
+            user_id=user_id,
+            email="unknown@local.jarvis",
+        )
+        return str(session["id"])
+
+    def _build_user_context(
+        self,
+        *,
+        user_id: str,
+        chat_id: str,
+        route: str = "deep",
+    ) -> tuple[str, list[dict[str, str]]]:
+        settings = ensure_user_settings(self.db, user_id=user_id)
+        persona = get_selected_persona_for_user(self.db, user_id=user_id)
+        if persona is None:
+            persona = ensure_default_persona_for_user(self.db, user_id=user_id)
+
+        memories = list_memory_items(self.db, user_id=user_id, chat_id=chat_id, limit=5)
+        summary = get_latest_chat_summary(self.db, chat_id=chat_id)
+        recent_messages = list_recent_messages(self.db, chat_id, limit=12)
+        metadata = settings.get("metadata", {}) if isinstance(settings, dict) else {}
+        persona_hint = metadata.get("persona_hint") if isinstance(metadata, dict) else None
+        custom_instructions = (
+            metadata.get("custom_instructions") if isinstance(metadata, dict) else None
+        )
+        memory_lines = [
+            f"- ({item['type']}/{item['importance']}) {item['content']}"
+            for item in memories
+        ]
+        context_parts = [
+            "## User Context",
+            f"Persona: {persona['prompt_template']}",
+            f"Tone: {persona['tone'] or 'balanced'}",
+            f"Route mode: {route}",
+            f"User locale: {settings['locale']}",
+            f"User timezone: {settings['timezone']}",
+            f"Preferred response style: {settings['response_style']}",
+        ]
+        if persona_hint:
+            context_parts.append(f"Persona hint from user settings: {persona_hint}")
+        if custom_instructions:
+            context_parts.append(f"Custom user instructions: {custom_instructions}")
+        if memory_lines:
+            context_parts.append("Relevant memory:\n" + "\n".join(memory_lines))
+        if summary is not None and summary.get("summary_text"):
+            context_parts.append("Conversation summary:\n" + summary["summary_text"])
+        return "\n\n".join(context_parts), recent_messages
+
+    def _with_user_context(
+        self,
+        *,
+        system_prompt: str,
+        user_id: str,
+        chat_id: str,
+    ) -> tuple[str, list[dict[str, str]]]:
+        user_context, recent_messages = self._build_user_context(
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        return f"{system_prompt}\n\n{user_context}", recent_messages
 
     # ── AI 기반 플래닝 ─────────────────────────────────────
 
@@ -279,6 +527,13 @@ class DeepThinkService:
     ) -> DeepThinkPlanInternalResponse:
         """AI deep model을 사용해서 실행 플랜을 생성한다."""
         model = self._select_deep_model(user_id)
+        chat_id = self._get_chat_session_id(user_id)
+        system_prompt, context_messages = self._with_user_context(
+            system_prompt=_get_planning_prompt(),
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        add_message(self.db, chat_id, "user", body.message)
         logger.info(
             "deepthink plan request_id=%s model=%s/%s",
             body.request_id,
@@ -289,9 +544,10 @@ class DeepThinkService:
         ai_result = await self.ai_service.respond_once(
             self._build_ai_request(
                 model=model,
-                system_prompt=_get_planning_prompt(),
+                system_prompt=system_prompt,
                 user_message=body.message,
                 request_id=body.request_id,
+                context_messages=context_messages,
             )
         )
 
@@ -319,14 +575,14 @@ class DeepThinkService:
                 title=step.get("title", f"Step {idx}"),
                 description=step.get("description", ""),
             )
-            for idx, step in enumerate(plan_data.get("steps", []), start=1)
+            for idx, step in enumerate(_coerce_plan_steps(plan_data), start=1)
         ]
 
         return DeepThinkPlanInternalResponse(
             request_id=body.request_id,
-            goal=plan_data.get("goal", body.message),
+            goal=plan_data.get("goal", body.message) if isinstance(plan_data, dict) else body.message,
             steps=steps,
-            constraints=plan_data.get("constraints", []),
+            constraints=plan_data.get("constraints", []) if isinstance(plan_data, dict) else [],
         )
 
     # ── AI 기반 실행 ───────────────────────────────────────
@@ -345,6 +601,12 @@ class DeepThinkService:
         클라이언트 실행 액션(terminal, mouse 등)은 response.actions로 반환한다.
         """
         model = self._select_deep_model(user_id)
+        chat_id = self._get_chat_session_id(user_id)
+        execution_prompt, context_messages = self._with_user_context(
+            system_prompt=_get_execution_prompt(),
+            user_id=user_id,
+            chat_id=chat_id,
+        )
         logger.info(
             "deepthink execute request_id=%s model=%s/%s steps=%d",
             body.request_id,
@@ -355,7 +617,7 @@ class DeepThinkService:
 
         step_results: list[DeepThinkStepOutput] = []
         all_client_actions: list[ClientActionInternal] = []
-        accumulated_context: list[str] = []
+        accumulated_context: list[str] = list(body.execution_context)
 
         for step in body.plan_steps:
             step_prompt = (
@@ -375,15 +637,26 @@ class DeepThinkService:
                 ai_result = await self.ai_service.respond_once(
                     self._build_ai_request(
                         model=model,
-                        system_prompt=_get_execution_prompt(),
+                        system_prompt=execution_prompt,
                         user_message=step_prompt,
                         request_id=body.request_id,
+                        context_messages=context_messages,
                     )
                 )
                 step_content = ai_result["content"]
                 step_actions = _parse_actions_from_content(
                     step_content, step_id=step.id
                 )
+                if not step_actions:
+                    step_actions = _fallback_actions_from_step(
+                        message=body.message,
+                        step=step,
+                    )
+                    if step_actions:
+                        step_content = (
+                            f"{step_content}\n\n"
+                            "[fallback] 기본 브라우저 제어 액션을 생성했습니다."
+                        )
 
                 # 2) ActionExecutor가 분류·실행
                 exec_result: ExecutionResult = (
@@ -451,6 +724,8 @@ class DeepThinkService:
         content = "\n\n".join(
             f"### {s.title}\n{s.content}" for s in step_results
         )
+        if content:
+            add_message(self.db, chat_id, "assistant", content)
 
         return DeepThinkInternalResponse(
             request_id=body.request_id,
