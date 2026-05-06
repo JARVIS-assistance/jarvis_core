@@ -37,6 +37,7 @@ from core.db.db_operations import (
     update_user_persona,
     update_user_model_config,
 )
+from core.db.db_operations.model_config import get_active_realtime_model_for_user
 from router import choose_route
 from safety import safety_gate
 
@@ -207,16 +208,42 @@ class ChatService:
             if selected_model is not None and bool(
                 selected_model.get("is_active", True)
             ):
+                if purpose != "realtime" or bool(
+                    selected_model.get("supports_realtime", False)
+                ):
+                    logger.info(
+                        "[chat] model selected purpose=%s provider=%s/%s model=%s config_id=%s user=%s",
+                        purpose,
+                        selected_model["provider_mode"],
+                        selected_model["provider_name"],
+                        selected_model["model_name"],
+                        selected_model["id"],
+                        user_id,
+                    )
+                    return selected_model
                 logger.info(
-                    "[chat] model selected purpose=%s provider=%s/%s model=%s config_id=%s user=%s",
-                    purpose,
-                    selected_model["provider_mode"],
-                    selected_model["provider_name"],
+                    "[chat] selected realtime model ignored because supports_realtime=false "
+                    "model=%s config_id=%s user=%s",
                     selected_model["model_name"],
                     selected_model["id"],
                     user_id,
                 )
-                return selected_model
+
+        if purpose == "realtime":
+            realtime_config = get_active_realtime_model_for_user(
+                self.db, user_id=user_id
+            )
+            if realtime_config is not None:
+                logger.info(
+                    "[chat] model selected via realtime support "
+                    "provider=%s/%s model=%s config_id=%s user=%s",
+                    realtime_config["provider_mode"],
+                    realtime_config["provider_name"],
+                    realtime_config["model_name"],
+                    realtime_config["id"],
+                    user_id,
+                )
+                return realtime_config
 
         default_config = get_active_model_for_user(self.db, user_id=user_id)
         if default_config is not None and bool(default_config.get("is_default", False)):

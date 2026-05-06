@@ -177,6 +177,62 @@ def test_realtime_stream_prefers_selected_realtime_model_over_default(caplog) ->
     assert "model=selected-realtime-model" in caplog.text
 
 
+def test_realtime_stream_prefers_realtime_capable_model_without_selection() -> None:
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            default_response = client.post(
+                "/internal/chat/model-config",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "default-non-realtime-model",
+                    "is_default": True,
+                    "supports_stream": True,
+                    "supports_realtime": False,
+                },
+                headers={"x-user-id": "u-realtime-auto"},
+            )
+            assert default_response.status_code == 200
+
+            realtime_response = client.post(
+                "/internal/chat/model-config",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "realtime-enabled-model",
+                    "is_default": False,
+                    "supports_stream": True,
+                    "supports_realtime": True,
+                },
+                headers={"x-user-id": "u-realtime-auto"},
+            )
+            assert realtime_response.status_code == 200
+
+            with client.stream(
+                "POST",
+                "/internal/chat/stream",
+                json={"message": "바로 답해줘", "route_override": "realtime"},
+                headers={
+                    "x-user-id": "u-realtime-auto",
+                    "x-user-email": "u-realtime-auto@example.com",
+                    "x-request-id": "r-realtime-auto",
+                },
+            ) as response:
+                body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "realtime-enabled-model" in body
+    assert ai_client.requests[-1]["model_name"] == "realtime-enabled-model"
+
+
 def test_internal_persona_and_memory_endpoints() -> None:
     client = TestClient(create_app())
 

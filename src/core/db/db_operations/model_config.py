@@ -84,6 +84,39 @@ def get_active_model_for_user(db: DBClient, user_id: str) -> Optional[dict[str, 
     return _row_to_model_config(row)
 
 
+def get_active_realtime_model_for_user(
+    db: DBClient, user_id: str
+) -> Optional[dict[str, Any]]:
+    if db.backend == "postgres":
+        cursor = db.conn.execute(
+            """
+            SELECT id, provider_mode, provider_name, model_name, api_key, endpoint, is_active, is_default,
+                   supports_stream, supports_realtime, transport, input_modalities, output_modalities
+            FROM ai_model_configs
+            WHERE user_id = %s AND is_active = true AND supports_realtime = true
+            ORDER BY is_default DESC, updated_at DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        )
+    else:
+        cursor = db.conn.execute(
+            """
+            SELECT id, provider_mode, provider_name, model_name, api_key, endpoint, is_active, is_default,
+                   supports_stream, supports_realtime, transport, input_modalities, output_modalities
+            FROM ai_model_configs
+            WHERE user_id = ? AND is_active = 1 AND supports_realtime = 1
+            ORDER BY is_default DESC, updated_at DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return _row_to_model_config(row)
+
+
 def get_model_config_by_id_for_user(
     db: DBClient, user_id: str, model_config_id: str
 ) -> Optional[dict[str, Any]]:
