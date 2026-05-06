@@ -18,7 +18,6 @@ _PROMPTS_YAML_ENV = "JARVIS_PROMPTS_YAML"
 # 기본 경로: jarvis_core 기준으로 workbench의 config/prompts.yaml
 _DEFAULT_PATH = (
     Path(__file__).resolve().parents[4]          # jarvis_core/
-    / ".."                                        # core/
     / "jarvis_ai_workbench" / "config" / "prompts.yaml"
 )
 

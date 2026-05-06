@@ -6,6 +6,7 @@ from ai import AIService
 from jarvis_contracts import JarvisCoreEndpoints
 
 from app import create_app
+from core.config.prompt_loader import load_prompt
 from core.db.db_connection import connect
 
 
@@ -107,6 +108,40 @@ def test_internal_chat_request_accepts_deep_override() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["route"] == "deep"
+
+
+def test_default_prompt_loader_reads_workbench_prompt() -> None:
+    prompt = load_prompt("base_system")
+
+    assert prompt is not None
+    assert "네! 시도해보겠습니다" in prompt
+
+
+def test_realtime_request_uses_workbench_base_prompt() -> None:
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/chat/request",
+                json={"message": "브라우저 열어줘", "route_override": "realtime"},
+                headers={
+                    "x-user-id": "u-prompt",
+                    "x-user-email": "u-prompt@example.com",
+                    "x-request-id": "r-prompt",
+                },
+            )
+
+    assert response.status_code == 200
+    system_prompt = str(ai_client.requests[-1]["system_prompt"])
+    assert "네! 시도해보겠습니다" in system_prompt
+    assert "Do not explain that you cannot operate the screen" in system_prompt
 
 
 def test_realtime_stream_prefers_selected_realtime_model_over_default(caplog) -> None:
