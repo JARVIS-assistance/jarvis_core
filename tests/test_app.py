@@ -1,3 +1,4 @@
+import logging
 from tempfile import NamedTemporaryFile
 
 from fastapi.testclient import TestClient
@@ -108,7 +109,7 @@ def test_internal_chat_request_accepts_deep_override() -> None:
     assert payload["route"] == "deep"
 
 
-def test_realtime_stream_prefers_selected_realtime_model_over_default() -> None:
+def test_realtime_stream_prefers_selected_realtime_model_over_default(caplog) -> None:
     ai_client = RecordingAIClient()
     ai_service = AIService(
         default_client=ai_client,
@@ -118,6 +119,7 @@ def test_realtime_stream_prefers_selected_realtime_model_over_default() -> None:
 
     with NamedTemporaryFile(suffix=".db") as db_file:
         app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        caplog.set_level(logging.INFO, logger="jarvis_core.chat")
         with TestClient(app) as client:
             default_response = client.post(
                 "/internal/chat/model-config",
@@ -170,6 +172,9 @@ def test_realtime_stream_prefers_selected_realtime_model_over_default() -> None:
     assert response.status_code == 200
     assert "selected-realtime-model" in body
     assert ai_client.requests[-1]["model_name"] == "selected-realtime-model"
+    assert "model request request_id=r-model" in caplog.text
+    assert "model response request_id=r-model" in caplog.text
+    assert "model=selected-realtime-model" in caplog.text
 
 
 def test_internal_persona_and_memory_endpoints() -> None:

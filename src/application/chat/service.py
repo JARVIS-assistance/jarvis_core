@@ -89,6 +89,55 @@ def _get_base_system_prompt() -> str:
     return loaded if loaded else _BASE_SYSTEM_PROMPT_FALLBACK
 
 
+def _log_model_request(
+    *,
+    request_id: str,
+    user_id: str,
+    route: str,
+    purpose: str,
+    model: dict[str, object],
+    stream: str,
+) -> None:
+    logger.info(
+        "[chat] model request request_id=%s user=%s route=%s purpose=%s "
+        "stream=%s provider=%s/%s model=%s config_id=%s",
+        request_id,
+        user_id,
+        route,
+        purpose,
+        stream,
+        model.get("provider_mode"),
+        model.get("provider_name"),
+        model.get("model_name"),
+        model.get("id"),
+    )
+
+
+def _log_model_response(
+    *,
+    request_id: str,
+    user_id: str,
+    route: str,
+    provider_mode: object,
+    provider_name: object,
+    model_name: object,
+    stream: str,
+    output_chars: int,
+) -> None:
+    logger.info(
+        "[chat] model response request_id=%s user=%s route=%s stream=%s "
+        "provider=%s/%s model=%s output_chars=%d",
+        request_id,
+        user_id,
+        route,
+        stream,
+        provider_mode,
+        provider_name,
+        model_name,
+        output_chars,
+    )
+
+
 def _build_alternating_messages(
     *,
     system_prompt: str | None,
@@ -270,6 +319,14 @@ class ChatService:
 
         purpose = "deep" if route == "deep" else "realtime"
         selected = self._select_model_config(user_id=user_id, purpose=purpose)
+        _log_model_request(
+            request_id=request_id,
+            user_id=user_id,
+            route=route,
+            purpose=purpose,
+            model=selected,
+            stream="once",
+        )
         ai_result = await self.ai_service.respond_once(
             {
                 "message": body.message,
@@ -287,6 +344,16 @@ class ChatService:
                     user_message=body.message,
                 ),
             }
+        )
+        _log_model_response(
+            request_id=request_id,
+            user_id=user_id,
+            route=route,
+            provider_mode=ai_result["provider_mode"],
+            provider_name=ai_result["provider_name"],
+            model_name=ai_result["model_name"],
+            stream="once",
+            output_chars=len(str(ai_result["content"])),
         )
         add_message(self.db, session_id, "assistant", ai_result["content"])
         return {
@@ -374,6 +441,16 @@ class ChatService:
         full = "".join(chunks).strip()
         if full:
             add_message(self.db, chat_session_id, "assistant", full)
+        _log_model_response(
+            request_id=request_id,
+            user_id=str(request_payload.get("user_id", "")),
+            route=str(request_payload.get("route", "")),
+            provider_mode=request_payload.get("provider_mode"),
+            provider_name=request_payload.get("provider_name"),
+            model_name=request_payload.get("model_name"),
+            stream="websocket",
+            output_chars=len(full),
+        )
         await websocket.send_json({"type": "assistant_done", "request_id": request_id})
 
     # ── run_realtime ────────────────────────────────────────────
@@ -494,6 +571,15 @@ class ChatService:
                         user_message=content,
                     ),
                 }
+                request_payload["user_id"] = user_id
+                _log_model_request(
+                    request_id=request_id,
+                    user_id=user_id,
+                    route=route,
+                    purpose="realtime",
+                    model=selected,
+                    stream="websocket",
+                )
                 active_request = request_payload
 
                 if active_rt_session_id is None:
@@ -589,6 +675,7 @@ class ChatService:
             "message": message,
             "route": route,
             "request_id": request_id,
+            "user_id": user_id,
             "provider_mode": str(selected["provider_mode"]),
             "provider_name": str(selected["provider_name"]),
             "model_name": str(selected["model_name"]),
@@ -601,6 +688,14 @@ class ChatService:
                 user_message=message,
             ),
         }
+        _log_model_request(
+            request_id=request_id,
+            user_id=user_id,
+            route=route,
+            purpose=purpose,
+            model=selected,
+            stream="sse",
+        )
 
         # meta event
         meta = {
@@ -626,6 +721,16 @@ class ChatService:
         full = "".join(chunks).strip()
         if full:
             add_message(self.db, session_id, "assistant", full)
+        _log_model_response(
+            request_id=request_id,
+            user_id=user_id,
+            route=route,
+            provider_mode=selected["provider_mode"],
+            provider_name=selected["provider_name"],
+            model_name=selected["model_name"],
+            stream="sse",
+            output_chars=len(full),
+        )
 
         yield f"event: assistant_done\ndata: {json.dumps({'request_id': request_id, 'content': full})}\n\n"
 
