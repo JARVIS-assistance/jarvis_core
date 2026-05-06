@@ -143,19 +143,6 @@ class ChatService:
     def _select_model_config(
         self, user_id: str, purpose: str
     ) -> dict[str, str | bool | None]:
-        default_config = get_active_model_for_user(self.db, user_id=user_id)
-        if default_config is not None and bool(default_config.get("is_default", False)):
-            logger.info(
-                "[chat] model selected via default purpose=%s provider=%s/%s model=%s config_id=%s user=%s",
-                purpose,
-                default_config["provider_mode"],
-                default_config["provider_name"],
-                default_config["model_name"],
-                default_config["id"],
-                user_id,
-            )
-            return default_config
-
         selected_id: str | None = None
         selection = get_user_ai_selection(self.db, user_id=user_id)
         if selection is not None:
@@ -181,6 +168,19 @@ class ChatService:
                     user_id,
                 )
                 return selected_model
+
+        default_config = get_active_model_for_user(self.db, user_id=user_id)
+        if default_config is not None and bool(default_config.get("is_default", False)):
+            logger.info(
+                "[chat] model selected via default purpose=%s provider=%s/%s model=%s config_id=%s user=%s",
+                purpose,
+                default_config["provider_mode"],
+                default_config["provider_name"],
+                default_config["model_name"],
+                default_config["id"],
+                user_id,
+            )
+            return default_config
 
         result = default_config or {**self._fallback_model_config()}
         logger.info(

@@ -35,6 +35,7 @@ class RecordingAIClient:
         yield {"type": "done", "content": ""}
 
     async def stream_tokens(self, request: dict[str, object]):
+        self.requests.append(request)
         yield "ok"
 
     async def realtime_session_start(self, request: dict[str, object]) -> str:
@@ -105,6 +106,70 @@ def test_internal_chat_request_accepts_deep_override() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["route"] == "deep"
+
+
+def test_realtime_stream_prefers_selected_realtime_model_over_default() -> None:
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            default_response = client.post(
+                "/internal/chat/model-config",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "default-model",
+                    "is_default": True,
+                    "supports_stream": True,
+                    "supports_realtime": True,
+                },
+                headers={"x-user-id": "u-model"},
+            )
+            assert default_response.status_code == 200
+
+            realtime_response = client.post(
+                "/internal/chat/model-config",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "selected-realtime-model",
+                    "is_default": False,
+                    "supports_stream": True,
+                    "supports_realtime": True,
+                },
+                headers={"x-user-id": "u-model"},
+            )
+            assert realtime_response.status_code == 200
+            realtime_id = realtime_response.json()["id"]
+
+            selection_response = client.post(
+                "/internal/chat/model-selection",
+                json={"realtime_model_config_id": realtime_id},
+                headers={"x-user-id": "u-model"},
+            )
+            assert selection_response.status_code == 200
+
+            with client.stream(
+                "POST",
+                "/internal/chat/stream",
+                json={"message": "바로 답해줘", "route_override": "realtime"},
+                headers={
+                    "x-user-id": "u-model",
+                    "x-user-email": "u-model@example.com",
+                    "x-request-id": "r-model",
+                },
+            ) as response:
+                body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "selected-realtime-model" in body
+    assert ai_client.requests[-1]["model_name"] == "selected-realtime-model"
 
 
 def test_internal_persona_and_memory_endpoints() -> None:
