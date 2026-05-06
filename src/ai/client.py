@@ -5,18 +5,17 @@ import json
 import logging
 import os
 from collections.abc import AsyncGenerator
-from functools import partial
-from uuid import uuid4
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 import aiohttp
 
-logger = logging.getLogger(__name__)
-
 from .schemas import AIRequest, AIResponse, AIStreamChunk
+
+logger = logging.getLogger(__name__)
 
 
 class AIClient(Protocol):
@@ -314,7 +313,7 @@ class LocalLLMAIClient(StubAIClient):
         """aiohttp로 OpenAI-compatible SSE 엔드포인트에서 토큰을 실시간 스트리밍."""
         provider = request["provider_name"].lower()
         if provider == "ollama":
-            async for token in super().stream_tokens(request):
+            async for token in self._stream_ollama_tokens(request):
                 yield token
             return
 
@@ -366,6 +365,59 @@ class LocalLLMAIClient(StubAIClient):
             yield f"[provider-error] {exc}"
 
     # ── respond_once / realtime (unchanged pattern) ─────────────────
+
+    async def _stream_ollama_tokens(
+        self,
+        request: AIRequest,
+    ) -> AsyncGenerator[str, None]:
+        endpoint = (request.get("endpoint") or "http://localhost:11434").rstrip(
+            "/"
+        ) + "/api/generate"
+        payload = {
+            "model": request["model_name"],
+            "prompt": self._build_prompt_text(request),
+            "stream": True,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/x-ndjson",
+            "User-Agent": "JARVIS/1.0",
+        }
+        logger.info("[AI-OLLAMA-STREAM-REQUEST] POST %s", endpoint)
+
+        timeout = aiohttp.ClientTimeout(total=120, connect=10)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(endpoint, json=payload, headers=headers) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error(
+                            "[AI-OLLAMA-STREAM-ERROR] status=%s body=%s",
+                            resp.status,
+                            body[:300],
+                        )
+                        yield f"[provider-error] HTTP {resp.status}"
+                        return
+
+                    count = 0
+                    async for raw_line in resp.content:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        token = chunk.get("response")
+                        if isinstance(token, str) and token:
+                            count += 1
+                            yield token
+                        if chunk.get("done") is True:
+                            break
+                    logger.info("[AI-OLLAMA-STREAM-RESPONSE] streamed %d tokens", count)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.error("[AI-OLLAMA-STREAM-ERROR] %s", exc)
+            yield f"[provider-error] {exc}"
 
     async def respond_once(self, request: AIRequest) -> AIResponse:
         provider = request["provider_name"].lower()
