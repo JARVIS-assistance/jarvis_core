@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -104,3 +104,39 @@ class MemoryResponse(BaseModel):
     source_message_id: str | None = None
     created_at: str
     expires_at: str | None = None
+
+
+class RuntimeApplication(BaseModel):
+    id: str | None = None
+    name: str = Field(min_length=1, max_length=160)
+    display_name: str | None = Field(default=None, max_length=160)
+    aliases: list[str] = Field(default_factory=list)
+    bundle_id: str | None = Field(default=None, max_length=240)
+    path: str | None = None
+    executable: str | None = Field(default=None, max_length=240)
+    kind: str | None = Field(default=None, max_length=80)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TerminalProfile(BaseModel):
+    enabled: bool = False
+    shell: str | None = Field(default=None, max_length=80)
+    shell_path: str | None = None
+    cwd: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    supports_pty: bool = False
+    requires_confirm: bool = True
+    timeout_seconds: int = Field(default=30, ge=1, le=600)
+
+
+class RuntimeProfileUpsertRequest(BaseModel):
+    platform: str | None = Field(default=None, max_length=40)
+    default_browser: str | None = Field(default=None, max_length=80)
+    capabilities: Any = Field(default_factory=list)
+    applications: list[RuntimeApplication] = Field(default_factory=list)
+    terminal: TerminalProfile | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RuntimeProfileResponse(RuntimeProfileUpsertRequest):
+    updated_at: str | None = None

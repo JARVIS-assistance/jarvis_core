@@ -381,3 +381,26 @@ def update_user_model_config(
     if row is None:
         return None
     return _row_to_model_config(row)
+
+
+def delete_user_model_config(
+    db: DBClient,
+    user_id: str,
+    model_config_id: str,
+) -> bool:
+    existing = get_model_config_by_id_for_user(db, user_id, model_config_id)
+    if existing is None:
+        return False
+
+    if db.backend == "postgres":
+        cursor = db.conn.execute(
+            "DELETE FROM ai_model_configs WHERE id = %s AND user_id = %s",
+            (model_config_id, user_id),
+        )
+    else:
+        cursor = db.conn.execute(
+            "DELETE FROM ai_model_configs WHERE id = ? AND user_id = ?",
+            (model_config_id, user_id),
+        )
+    db.conn.commit()
+    return int(getattr(cursor, "rowcount", 0) or 0) > 0

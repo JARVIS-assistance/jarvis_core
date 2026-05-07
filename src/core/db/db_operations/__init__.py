@@ -3,6 +3,7 @@ from .common import now_iso
 from .messages import add_message, list_recent_messages
 from .model_config import (
     create_user_model_config,
+    delete_user_model_config,
     get_active_model_for_user,
     get_model_config_by_id_for_user,
     list_user_model_configs,
@@ -20,7 +21,12 @@ from .persona_memory import (
     update_user_persona,
 )
 from .sessions import create_session, ensure_user_exists, get_or_create_session_for_user, get_session
-from .user_settings import ensure_user_settings, get_user_settings
+from .user_settings import (
+    ensure_user_settings,
+    get_runtime_profile,
+    get_user_settings,
+    set_runtime_profile,
+)
 from .user import create_user, find_user_by_email, find_user_by_id
 
 __all__ = [
@@ -30,6 +36,7 @@ __all__ = [
     "create_session",
     "create_user",
     "create_user_model_config",
+    "delete_user_model_config",
     "create_user_persona",
     "ensure_default_persona_for_user",
     "ensure_user_exists",
@@ -41,6 +48,7 @@ __all__ = [
     "get_or_create_session_for_user",
     "get_selected_persona_for_user",
     "get_session",
+    "get_runtime_profile",
     "get_user_ai_selection",
     "get_user_settings",
     "list_recent_messages",
@@ -51,6 +59,7 @@ __all__ = [
     "rebuild_chat_summary",
     "select_user_persona",
     "set_user_ai_selection",
+    "set_runtime_profile",
     "update_user_persona",
     "update_user_model_config",
 ]

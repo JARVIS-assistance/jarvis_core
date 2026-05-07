@@ -65,6 +65,11 @@ Available capabilities for planning:
 Planning rules:
 - 1~6 steps, each step must be concrete and actionable
 - Steps should be ordered by dependency
+- Do not collapse a multi-operation request into one broad step. Use the fewest
+  steps that preserve every distinct operation the user asked for.
+- If a request opens/focuses an app and asks JARVIS to write/create/compose
+  content there, keep that as separate ordered steps: open/focus the app,
+  compose the final content, then type or paste the final content.
 - For **information/search requests** (weather, news, prices, general knowledge):
   1. web_search step to retrieve the information
   2. notify step to present the summarized result to the user

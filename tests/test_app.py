@@ -2,9 +2,9 @@ import logging
 from tempfile import NamedTemporaryFile
 
 from fastapi.testclient import TestClient
-from ai import AIService
 from jarvis_contracts import JarvisCoreEndpoints
 
+from ai import AIService
 from app import create_app
 from core.config.prompt_loader import load_prompt
 from core.db.db_connection import connect
@@ -114,7 +114,7 @@ def test_default_prompt_loader_reads_workbench_prompt() -> None:
     prompt = load_prompt("base_system")
 
     assert prompt is not None
-    assert "네! 시도해보겠습니다" in prompt
+    assert "진행하겠습니다!" in prompt
 
 
 def test_realtime_request_uses_workbench_base_prompt() -> None:
@@ -140,8 +140,48 @@ def test_realtime_request_uses_workbench_base_prompt() -> None:
 
     assert response.status_code == 200
     system_prompt = str(ai_client.requests[-1]["system_prompt"])
-    assert "네! 시도해보겠습니다" in system_prompt
+    assert "진행하겠습니다!" in system_prompt
     assert "Do not explain that you cannot operate the screen" in system_prompt
+
+
+def test_realtime_stream_marks_latest_user_message_as_current_turn() -> None:
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            for index, message in enumerate(
+                (
+                    "점심 메뉴 추천해줘",
+                    "sublimetext켜서 안녕하세요 작성해볼래?",
+                )
+            ):
+                with client.stream(
+                    "POST",
+                    "/internal/chat/stream",
+                    json={"message": message, "route_override": "realtime"},
+                    headers={
+                        "x-user-id": "u-latest-turn",
+                        "x-user-email": "u-latest-turn@example.com",
+                        "x-request-id": f"r-latest-{index}",
+                    },
+                ) as response:
+                    body = "".join(response.iter_text())
+                assert response.status_code == 200
+                assert "assistant_delta" in body
+
+    messages = ai_client.requests[-1]["messages"]
+    latest = messages[-1]
+    assert latest["role"] == "user"
+    assert latest["content"].startswith("Latest user message.")
+    assert "sublimetext켜서 안녕하세요 작성해볼래?" in latest["content"]
+    assert "점심 메뉴 추천" not in latest["content"]
+    assert "Current-turn priority" in str(ai_client.requests[-1]["system_prompt"])
 
 
 def test_realtime_stream_prefers_selected_realtime_model_over_default(caplog) -> None:
@@ -210,6 +250,47 @@ def test_realtime_stream_prefers_selected_realtime_model_over_default(caplog) ->
     assert "model request request_id=r-model" in caplog.text
     assert "model response request_id=r-model" in caplog.text
     assert "model=selected-realtime-model" in caplog.text
+
+
+def test_delete_model_config_removes_user_model() -> None:
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            created = client.post(
+                "/internal/chat/model-config",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "delete-me",
+                    "is_default": False,
+                    "supports_stream": True,
+                    "supports_realtime": False,
+                },
+                headers={"x-user-id": "u-delete-model"},
+            )
+            assert created.status_code == 200
+            model_id = created.json()["id"]
+
+            deleted = client.delete(
+                f"/internal/chat/model-config/{model_id}",
+                headers={"x-user-id": "u-delete-model"},
+            )
+            listed = client.get(
+                "/internal/chat/model-config",
+                headers={"x-user-id": "u-delete-model"},
+            )
+
+    assert deleted.status_code == 200
+    assert deleted.json() == {"id": model_id, "deleted": True}
+    assert listed.status_code == 200
+    assert listed.json() == []
 
 
 def test_realtime_stream_prefers_realtime_capable_model_without_selection() -> None:

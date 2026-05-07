@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI, Header, HTTPException, status
+from fastapi import FastAPI, Header
 from fastapi.responses import StreamingResponse
 from jarvis_contracts import (
     ClientAction,
@@ -19,12 +19,6 @@ from jarvis_contracts import (
 
 from ai import AIService
 from ai.client import StubAIClient
-from application.deepthink import DeepThinkService
-from application.deepthink.schemas import (
-    DeepThinkInternalRequest,
-    DeepThinkPlanInternalRequest,
-    DeepThinkStepInput,
-)
 from application.chat.schemas import (
     ChatOnceRequest,
     ChatOnceResponse,
@@ -37,9 +31,18 @@ from application.chat.schemas import (
     PersonaResponse,
     PersonaSelectionRequest,
     PersonaUpsertRequest,
+    RuntimeProfileResponse,
+    RuntimeProfileUpsertRequest,
 )
 from application.chat.service import ChatService
+from application.deepthink import DeepThinkService
+from application.deepthink.schemas import (
+    DeepThinkInternalRequest,
+    DeepThinkPlanInternalRequest,
+    DeepThinkStepInput,
+)
 from core.db.db_connection import DBClient, connect
+from core.db.db_operations import get_runtime_profile, set_runtime_profile
 from core.db.db_schema import init_db
 from jarvis_core import available_modes, run_deep_thinking, run_realtime_conversation
 from middleware import RequestIDMiddleware
@@ -191,6 +194,17 @@ def create_app(db: DBClient | None = None, ai_service: AIService | None = None) 
         )
         return ModelConfigResponse(**result)
 
+    @app.delete("/internal/chat/model-config/{model_config_id}")
+    def delete_model_config(
+        model_config_id: str,
+        x_user_id: str = Header(...),
+    ) -> dict[str, bool | str]:
+        service = _get_chat_service(app)
+        return service.delete_model_config(
+            user_id=x_user_id,
+            model_config_id=model_config_id,
+        )
+
     @app.post("/internal/chat/model-selection", response_model=ModelSelectionResponse)
     def set_model_selection(
         body: ModelSelectionUpsertRequest,
@@ -265,6 +279,33 @@ def create_app(db: DBClient | None = None, ai_service: AIService | None = None) 
         service = _get_chat_service(app)
         result = service.list_memory(user_id=x_user_id, chat_id=chat_id)
         return [MemoryResponse(**item) for item in result]
+
+    # ── internal: client runtime profile ──────────────────────
+
+    @app.put(
+        JarvisCoreEndpoints.INTERNAL_CLIENT_RUNTIME_PROFILE.path,
+        response_model=RuntimeProfileResponse,
+    )
+    def upsert_runtime_profile(
+        body: RuntimeProfileUpsertRequest,
+        x_user_id: str = Header(...),
+    ) -> RuntimeProfileResponse:
+        result = set_runtime_profile(
+            app.state.db,
+            user_id=x_user_id,
+            profile=body.model_dump(),
+        )
+        return RuntimeProfileResponse(**result)
+
+    @app.get(
+        JarvisCoreEndpoints.INTERNAL_CLIENT_RUNTIME_PROFILE_GET.path,
+        response_model=RuntimeProfileResponse,
+    )
+    def read_runtime_profile(
+        x_user_id: str = Header(...),
+    ) -> RuntimeProfileResponse:
+        result = get_runtime_profile(app.state.db, user_id=x_user_id)
+        return RuntimeProfileResponse(**result)
 
     # ── internal: deepthink ────────────────────────────────
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import AsyncGenerator
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from core.db.db_connection import DBClient
 from core.db.db_operations import (
     add_message,
     create_user_model_config,
+    delete_user_model_config,
     create_memory_item,
     create_user_persona,
     ensure_default_persona_for_user,
@@ -64,7 +66,7 @@ You are JARVIS — an intelligent AI assistant system.
 1. Always respond in the same language the user uses. If the user writes in Korean, respond in Korean. If English, respond in English.
 2. Be accurate. If you are unsure, say so honestly rather than guessing.
 3. Be concise but thorough. Avoid unnecessary filler, but include all relevant details.
-4. When the user asks you to do something (open apps, search, create files, etc.), focus on carrying out the action rather than explaining what you would do.
+4. When the user asks you to do something (open apps, search, create files, etc.), respond exactly: "진행하겠습니다!".
 5. Respect privacy. Never ask for sensitive personal information unless the user offers it.
 6. If a request is ambiguous, ask one clarifying question before proceeding.
 7. Do not emit ```actions blocks or JSON action blocks in normal chat responses. Client actions are created by the Controller action registry path.
@@ -81,6 +83,8 @@ You are JARVIS — an intelligent AI assistant system.
 - Use markdown formatting when it improves readability (lists, bold, code blocks).
 - For simple questions, answer directly without unnecessary structure.
 - For complex tasks, break down into clear steps.
+- If the message is an action request that the Controller should execute (for example opening a browser/app, searching, clicking, typing, running shell, checking the screen, or controlling the computer), respond exactly: "진행하겠습니다!"
+- Do not explain that you cannot operate the screen for action requests. The Controller action intent lane runs in parallel and will attempt the action.
 """
 
 
@@ -161,11 +165,30 @@ def _build_alternating_messages(
         else:
             messages.append({"role": role, "content": content})
 
-    if messages and messages[-1]["role"] == "user":
-        messages[-1]["content"] += f"\n\n{user_message}"
-    else:
-        messages.append({"role": "user", "content": user_message})
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Latest user message. Respond to this message, not to the previous topic, "
+                "unless this message explicitly refers back to it:\n"
+                f"{user_message}"
+            ),
+        }
+    )
     return messages
+
+
+def _recent_context_limit(route: str) -> int:
+    if route == "deep":
+        return _int_env("JARVIS_DEEP_CONTEXT_RECENT_LIMIT", 12)
+    return _int_env("JARVIS_REALTIME_CONTEXT_RECENT_LIMIT", 4)
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
 
 
 class ChatService:
@@ -284,7 +307,11 @@ class ChatService:
 
         memories = list_memory_items(self.db, user_id=user_id, chat_id=chat_id, limit=5)
         summary = get_latest_chat_summary(self.db, chat_id=chat_id)
-        recent_messages = list_recent_messages(self.db, chat_id, limit=12)
+        recent_messages = list_recent_messages(
+            self.db,
+            chat_id,
+            limit=_recent_context_limit(route),
+        )
         metadata = settings.get("metadata", {}) if isinstance(settings, dict) else {}
         persona_hint = metadata.get("persona_hint") if isinstance(metadata, dict) else None
         custom_instructions = metadata.get("custom_instructions") if isinstance(metadata, dict) else None
@@ -303,6 +330,8 @@ class ChatService:
             f"User timezone: {settings['timezone']}",
             f"Preferred response style: {settings['response_style']}",
             route_line,
+            "Current-turn priority: answer or execute the latest user message. "
+            "Do not continue a previous topic unless the latest message clearly refers to it.",
         ]
         if persona_hint:
             system_parts.append(f"Persona hint from user settings: {persona_hint}")
@@ -828,6 +857,16 @@ class ChatService:
                 deep_model_config_id=str(result["id"]),
             )
         return result
+
+    def delete_model_config(self, user_id: str, model_config_id: str) -> dict[str, bool | str]:
+        deleted = delete_user_model_config(
+            self.db,
+            user_id=user_id,
+            model_config_id=model_config_id,
+        )
+        if not deleted:
+            raise HTTPException(status_code=404, detail="model config not found")
+        return {"id": model_config_id, "deleted": True}
 
     def set_model_selection(
         self, user_id: str, body: ModelSelectionUpsertRequest
