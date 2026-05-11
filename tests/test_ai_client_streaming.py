@@ -20,9 +20,15 @@ class _FakeContent:
 
 
 class _FakeResponse:
-    status = 200
-
-    def __init__(self, lines: list[dict[str, object]] | None = None) -> None:
+    def __init__(
+        self,
+        lines: list[dict[str, object]] | None = None,
+        *,
+        status: int = 200,
+        body: str = "",
+    ) -> None:
+        self.status = status
+        self._body = body
         self.content = _FakeContent(
             lines
             or [
@@ -39,12 +45,13 @@ class _FakeResponse:
         return None
 
     async def text(self) -> str:
-        return ""
+        return self._body
 
 
 class _FakeSession:
     requests: list[dict[str, object]] = []
     response_lines: list[dict[str, object]] | None = None
+    statuses: list[int] = []
 
     def __init__(self, *, timeout) -> None:
         self.timeout = timeout
@@ -57,7 +64,12 @@ class _FakeSession:
 
     def post(self, endpoint, *, json, headers):
         self.requests.append({"endpoint": endpoint, "json": json, "headers": headers})
-        return _FakeResponse(self.response_lines)
+        status = self.statuses.pop(0) if self.statuses else 200
+        return _FakeResponse(
+            self.response_lines,
+            status=status,
+            body='{"error":"not found"}',
+        )
 
 
 class _NoRespondOnceLocalClient(LocalLLMAIClient):
@@ -147,4 +159,37 @@ def test_ollama_stream_tokens_uses_configured_chat_endpoint(monkeypatch) -> None
                 "User-Agent": "JARVIS/1.0",
             },
         }
+    ]
+
+
+def test_ollama_chat_stream_tokens_falls_back_to_wrapper_chat_endpoint(monkeypatch) -> None:
+    _FakeSession.requests.clear()
+    _FakeSession.statuses = [404, 200]
+    _FakeSession.response_lines = [
+        {"message": {"content": "wrapped "}, "done": False},
+        {"message": {"content": "stream"}, "done": False},
+        {"done": True},
+    ]
+    monkeypatch.setattr("ai.client.aiohttp.ClientSession", _FakeSession)
+
+    request = {
+        "message": "hello",
+        "route": "realtime",
+        "request_id": "r-ollama",
+        "provider_mode": "local",
+        "provider_name": "ollama_chat",
+        "model_name": "qwen2.5:1.5b",
+        "api_key": None,
+        "endpoint": "http://localhost:3030",
+        "system_prompt": "Be fast.",
+        "messages": [],
+    }
+
+    async def collect() -> list[str]:
+        return [token async for token in _NoRespondOnceLocalClient().stream_tokens(request)]
+
+    assert asyncio.run(collect()) == ["wrapped ", "stream"]
+    assert [item["endpoint"] for item in _FakeSession.requests] == [
+        "http://localhost:3030/api/chat",
+        "http://localhost:3030/chat",
     ]

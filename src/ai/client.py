@@ -7,7 +7,7 @@ import os
 from collections.abc import AsyncGenerator
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
@@ -203,6 +203,14 @@ class TokenAIClient(StubAIClient):
 
 
 class LocalLLMAIClient(StubAIClient):
+    OLLAMA_PROVIDER_NAMES = {
+        "ollama",
+        "ollama_chat",
+        "ollama-generate",
+        "ollma",
+        "ollmahost",
+    }
+
     @staticmethod
     def _build_messages(request: AIRequest) -> list[dict[str, str]]:
         if request.get("messages"):
@@ -226,14 +234,69 @@ class LocalLLMAIClient(StubAIClient):
         return "\n\n".join(parts)
 
     @staticmethod
-    def _resolve_ollama_endpoint(raw_endpoint: str | None) -> tuple[str, str]:
-        raw = (raw_endpoint or "http://localhost:11434").rstrip("/")
+    def _is_ollama_provider(provider_name: str) -> bool:
+        normalized = provider_name.strip().lower().replace(" ", "_")
+        return normalized in LocalLLMAIClient.OLLAMA_PROVIDER_NAMES
+
+    @staticmethod
+    def _normalize_localhost_endpoint(raw_endpoint: str) -> str:
+        """Make host-local model APIs reachable from Dockerized JARVIS services."""
+        if os.getenv("JARVIS_REWRITE_DOCKER_LOCALHOST", "1").lower() in {
+            "0",
+            "false",
+            "no",
+        }:
+            return raw_endpoint
+        if not os.path.exists("/.dockerenv"):
+            return raw_endpoint
+
+        parsed = urlparse(raw_endpoint)
+        if parsed.hostname not in {"localhost", "127.0.0.1"}:
+            return raw_endpoint
+
+        netloc = "host.docker.internal"
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        if parsed.username or parsed.password:
+            auth = parsed.username or ""
+            if parsed.password:
+                auth = f"{auth}:{parsed.password}"
+            netloc = f"{auth}@{netloc}"
+        return urlunparse(parsed._replace(netloc=netloc))
+
+    @staticmethod
+    def _resolve_ollama_endpoint(
+        raw_endpoint: str | None,
+        provider_name: str | None = None,
+    ) -> tuple[str, str]:
+        raw = LocalLLMAIClient._normalize_localhost_endpoint(
+            (raw_endpoint or "http://localhost:11434").rstrip("/")
+        )
         path = urlparse(raw).path.rstrip("/")
         if path.endswith("/api/chat") or path.endswith("/chat"):
             return raw, "chat"
         if path.endswith("/api/generate") or path.endswith("/generate"):
             return raw, "generate"
+        if (
+            provider_name
+            and provider_name.strip().lower().replace(" ", "_") == "ollama_chat"
+        ):
+            return f"{raw}/api/chat", "chat"
         return f"{raw}/api/generate", "generate"
+
+    @staticmethod
+    def _ollama_fallback_endpoint(endpoint: str, endpoint_type: str) -> str | None:
+        parsed = urlparse(endpoint)
+        path = parsed.path.rstrip("/")
+        if endpoint_type == "chat" and path.endswith("/api/chat"):
+            return urlunparse(
+                parsed._replace(path=path.removesuffix("/api/chat") + "/chat")
+            )
+        if endpoint_type == "generate" and path.endswith("/api/generate"):
+            return urlunparse(
+                parsed._replace(path=path.removesuffix("/api/generate") + "/generate")
+            )
+        return None
 
     @staticmethod
     def _post_json(
@@ -259,7 +322,10 @@ class LocalLLMAIClient(StubAIClient):
             raise
 
     async def _respond_ollama(self, request: AIRequest) -> AIResponse:
-        endpoint, endpoint_type = self._resolve_ollama_endpoint(request.get("endpoint"))
+        endpoint, endpoint_type = self._resolve_ollama_endpoint(
+            request.get("endpoint"),
+            request["provider_name"],
+        )
         if endpoint_type == "chat":
             payload = {
                 "model": request["model_name"],
@@ -272,11 +338,21 @@ class LocalLLMAIClient(StubAIClient):
                 "prompt": self._build_prompt_text(request),
                 "stream": False,
             }
-        data = self._post_json(
-            endpoint,
-            payload,
-            {"Content-Type": "application/json"},
-        )
+        try:
+            data = self._post_json(
+                endpoint,
+                payload,
+                {"Content-Type": "application/json"},
+            )
+        except HTTPError as exc:
+            fallback = self._ollama_fallback_endpoint(endpoint, endpoint_type)
+            if exc.code != 404 or fallback is None:
+                raise
+            data = self._post_json(
+                fallback,
+                payload,
+                {"Content-Type": "application/json"},
+            )
         if endpoint_type == "chat":
             content = data.get("message", {}).get("content")
         else:
@@ -331,7 +407,7 @@ class LocalLLMAIClient(StubAIClient):
     async def stream_tokens(self, request: AIRequest) -> AsyncGenerator[str, None]:
         """aiohttp로 OpenAI-compatible SSE 엔드포인트에서 토큰을 실시간 스트리밍."""
         provider = request["provider_name"].lower()
-        if provider == "ollama":
+        if self._is_ollama_provider(provider):
             async for token in self._stream_ollama_tokens(request):
                 yield token
             return
@@ -389,7 +465,10 @@ class LocalLLMAIClient(StubAIClient):
         self,
         request: AIRequest,
     ) -> AsyncGenerator[str, None]:
-        endpoint, endpoint_type = self._resolve_ollama_endpoint(request.get("endpoint"))
+        endpoint, endpoint_type = self._resolve_ollama_endpoint(
+            request.get("endpoint"),
+            request["provider_name"],
+        )
         if endpoint_type == "chat":
             payload = {
                 "model": request["model_name"],
@@ -407,41 +486,58 @@ class LocalLLMAIClient(StubAIClient):
             "Accept": "application/x-ndjson",
             "User-Agent": "JARVIS/1.0",
         }
-        logger.info("[AI-OLLAMA-STREAM-REQUEST] POST %s", endpoint)
+        endpoints = [endpoint]
+        fallback = self._ollama_fallback_endpoint(endpoint, endpoint_type)
+        if fallback is not None:
+            endpoints.append(fallback)
 
         timeout = aiohttp.ClientTimeout(total=120, connect=10)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(endpoint, json=payload, headers=headers) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.error(
-                            "[AI-OLLAMA-STREAM-ERROR] status=%s body=%s",
-                            resp.status,
-                            body[:300],
-                        )
-                        yield f"[provider-error] HTTP {resp.status}"
-                        return
+                for candidate_endpoint in endpoints:
+                    logger.info("[AI-OLLAMA-STREAM-REQUEST] POST %s", candidate_endpoint)
+                    async with session.post(
+                        candidate_endpoint, json=payload, headers=headers
+                    ) as resp:
+                        if resp.status == 404 and candidate_endpoint != endpoints[-1]:
+                            body = await resp.text()
+                            logger.info(
+                                "[AI-OLLAMA-STREAM-FALLBACK] status=404 endpoint=%s body=%s",
+                                candidate_endpoint,
+                                body[:300],
+                            )
+                            continue
 
-                    count = 0
-                    async for raw_line in resp.content:
-                        line = raw_line.decode("utf-8", errors="replace").strip()
-                        if not line:
-                            continue
-                        try:
-                            chunk = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if endpoint_type == "chat":
-                            token = chunk.get("message", {}).get("content")
-                        else:
-                            token = chunk.get("response")
-                        if isinstance(token, str) and token:
-                            count += 1
-                            yield token
-                        if chunk.get("done") is True:
-                            break
-                    logger.info("[AI-OLLAMA-STREAM-RESPONSE] streamed %d tokens", count)
+                        if resp.status != 200:
+                            body = await resp.text()
+                            logger.error(
+                                "[AI-OLLAMA-STREAM-ERROR] status=%s body=%s",
+                                resp.status,
+                                body[:300],
+                            )
+                            yield f"[provider-error] HTTP {resp.status}"
+                            return
+
+                        count = 0
+                        async for raw_line in resp.content:
+                            line = raw_line.decode("utf-8", errors="replace").strip()
+                            if not line:
+                                continue
+                            try:
+                                chunk = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if endpoint_type == "chat":
+                                token = chunk.get("message", {}).get("content")
+                            else:
+                                token = chunk.get("response")
+                            if isinstance(token, str) and token:
+                                count += 1
+                                yield token
+                            if chunk.get("done") is True:
+                                break
+                        logger.info("[AI-OLLAMA-STREAM-RESPONSE] streamed %d tokens", count)
+                        return
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.error("[AI-OLLAMA-STREAM-ERROR] %s", exc)
             yield f"[provider-error] {exc}"
@@ -449,7 +545,7 @@ class LocalLLMAIClient(StubAIClient):
     async def respond_once(self, request: AIRequest) -> AIResponse:
         provider = request["provider_name"].lower()
         try:
-            if provider == "ollama":
+            if self._is_ollama_provider(provider):
                 return await self._respond_ollama(request)
             return await self._respond_openai_compat(request)
         except (HTTPError, URLError, TimeoutError, KeyError, ValueError) as exc:
