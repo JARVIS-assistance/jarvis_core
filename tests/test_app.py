@@ -252,6 +252,113 @@ def test_realtime_stream_prefers_selected_realtime_model_over_default(caplog) ->
     assert "model=selected-realtime-model" in caplog.text
 
 
+def test_default_model_update_preserves_realtime_selection() -> None:
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            default_response = client.post(
+                "/internal/chat/model-config",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "default-non-realtime",
+                    "is_default": True,
+                    "supports_stream": False,
+                    "supports_realtime": False,
+                },
+                headers={"x-user-id": "u-preserve-selection"},
+            )
+            assert default_response.status_code == 200
+            default_id = default_response.json()["id"]
+
+            realtime_response = client.post(
+                "/internal/chat/model-config",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "selected-realtime",
+                    "is_default": False,
+                    "supports_stream": True,
+                    "supports_realtime": True,
+                },
+                headers={"x-user-id": "u-preserve-selection"},
+            )
+            assert realtime_response.status_code == 200
+            realtime_id = realtime_response.json()["id"]
+
+            selection_response = client.post(
+                "/internal/chat/model-selection",
+                json={"realtime_model_config_id": realtime_id},
+                headers={"x-user-id": "u-preserve-selection"},
+            )
+            assert selection_response.status_code == 200
+
+            updated_default = client.put(
+                f"/internal/chat/model-config/{default_id}",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "default-non-realtime",
+                    "is_default": True,
+                    "supports_stream": False,
+                    "supports_realtime": False,
+                },
+                headers={"x-user-id": "u-preserve-selection"},
+            )
+            assert updated_default.status_code == 200
+
+            current_selection = client.get(
+                "/internal/chat/model-selection",
+                headers={"x-user-id": "u-preserve-selection"},
+            )
+
+    assert current_selection.status_code == 200
+    assert current_selection.json()["realtime_model_config_id"] == realtime_id
+    assert current_selection.json()["deep_model_config_id"] == default_id
+
+
+def test_realtime_selection_rejects_non_realtime_model() -> None:
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            model_response = client.post(
+                "/internal/chat/model-config",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "default-non-realtime",
+                    "is_default": True,
+                    "supports_stream": False,
+                    "supports_realtime": False,
+                },
+                headers={"x-user-id": "u-reject-selection"},
+            )
+            assert model_response.status_code == 200
+
+            selection_response = client.post(
+                "/internal/chat/model-selection",
+                json={"realtime_model_config_id": model_response.json()["id"]},
+                headers={"x-user-id": "u-reject-selection"},
+            )
+
+    assert selection_response.status_code == 400
+    assert selection_response.json()["detail"] == "invalid realtime_model_config_id"
+
+
 def test_delete_model_config_removes_user_model() -> None:
     ai_client = RecordingAIClient()
     ai_service = AIService(

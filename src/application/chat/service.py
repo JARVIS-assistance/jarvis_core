@@ -814,12 +814,7 @@ class ChatService:
             output_modalities=body.output_modalities,
         )
         if body.is_default:
-            set_user_ai_selection(
-                self.db,
-                user_id=user_id,
-                realtime_model_config_id=str(result["id"]),
-                deep_model_config_id=str(result["id"]),
-            )
+            self._set_default_model_selection(user_id=user_id, default_model=result)
         return result
 
     def list_model_configs(self, user_id: str) -> list[dict[str, str | bool | None]]:
@@ -850,13 +845,41 @@ class ChatService:
         if result is None:
             raise HTTPException(status_code=404, detail="model config not found")
         if body.is_default:
-            set_user_ai_selection(
+            self._set_default_model_selection(user_id=user_id, default_model=result)
+        return result
+
+    def _set_default_model_selection(
+        self,
+        *,
+        user_id: str,
+        default_model: dict[str, str | bool | None],
+    ) -> dict[str, str | None]:
+        selection = get_user_ai_selection(self.db, user_id=user_id) or {}
+        realtime_model_config_id = selection.get("realtime_model_config_id")
+        if realtime_model_config_id:
+            realtime = get_model_config_by_id_for_user(
                 self.db,
                 user_id=user_id,
-                realtime_model_config_id=str(result["id"]),
-                deep_model_config_id=str(result["id"]),
+                model_config_id=realtime_model_config_id,
             )
-        return result
+            if (
+                realtime is None
+                or not bool(realtime.get("is_active", True))
+                or not bool(realtime.get("supports_realtime", False))
+            ):
+                realtime_model_config_id = None
+
+        if realtime_model_config_id is None and bool(
+            default_model.get("supports_realtime", False)
+        ):
+            realtime_model_config_id = str(default_model["id"])
+
+        return set_user_ai_selection(
+            self.db,
+            user_id=user_id,
+            realtime_model_config_id=realtime_model_config_id,
+            deep_model_config_id=str(default_model["id"]),
+        )
 
     def delete_model_config(self, user_id: str, model_config_id: str) -> dict[str, bool | str]:
         deleted = delete_user_model_config(
@@ -875,7 +898,7 @@ class ChatService:
             realtime = get_model_config_by_id_for_user(
                 self.db, user_id=user_id, model_config_id=body.realtime_model_config_id
             )
-            if realtime is None:
+            if realtime is None or not bool(realtime.get("supports_realtime", False)):
                 raise HTTPException(
                     status_code=400, detail="invalid realtime_model_config_id"
                 )
