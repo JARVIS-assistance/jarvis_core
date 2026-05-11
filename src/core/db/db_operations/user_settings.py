@@ -188,6 +188,9 @@ def _normalize_application(raw: dict[str, Any]) -> dict[str, Any] | None:
         "path": _string_or_none(raw.get("path")),
         "executable": _string_or_none(raw.get("executable")),
         "kind": _string_or_none(raw.get("kind")),
+        "capabilities": _string_list(raw.get("capabilities")),
+        "categories": _string_list(raw.get("categories")),
+        "keywords": _string_list(raw.get("keywords")),
         "metadata": raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {},
     }
 

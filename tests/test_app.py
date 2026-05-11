@@ -117,6 +117,38 @@ def test_default_prompt_loader_reads_workbench_prompt() -> None:
     assert "진행하겠습니다!" in prompt
 
 
+def test_runtime_profile_preserves_application_routing_metadata() -> None:
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name))
+        with TestClient(app) as client:
+            response = client.put(
+                JarvisCoreEndpoints.INTERNAL_CLIENT_RUNTIME_PROFILE.path,
+                json={
+                    "platform": "macos",
+                    "applications": [
+                        {
+                            "name": "Weather",
+                            "display_name": "Weather",
+                            "aliases": ["Weather", "weather", "날씨"],
+                            "bundle_id": "com.apple.weather",
+                            "executable": "Weather",
+                            "kind": "macos_app",
+                            "capabilities": ["weather", "forecast", "날씨", "예보"],
+                            "categories": ["weather"],
+                            "keywords": ["오늘 날씨", "지역 날씨"],
+                        }
+                    ],
+                },
+                headers={"x-user-id": "u-runtime"},
+            )
+
+            assert response.status_code == 200
+            app_profile = response.json()["applications"][0]
+            assert app_profile["capabilities"] == ["weather", "forecast", "날씨", "예보"]
+            assert app_profile["categories"] == ["weather"]
+            assert app_profile["keywords"] == ["오늘 날씨", "지역 날씨"]
+
+
 def test_realtime_request_uses_workbench_base_prompt() -> None:
     ai_client = RecordingAIClient()
     ai_service = AIService(

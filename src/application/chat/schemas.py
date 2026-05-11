@@ -111,6 +111,9 @@ class RuntimeApplication(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     display_name: str | None = Field(default=None, max_length=160)
     aliases: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
+    categories: list[str] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
     bundle_id: str | None = Field(default=None, max_length=240)
     path: str | None = None
     executable: str | None = Field(default=None, max_length=240)
