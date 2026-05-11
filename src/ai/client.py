@@ -226,6 +226,16 @@ class LocalLLMAIClient(StubAIClient):
         return "\n\n".join(parts)
 
     @staticmethod
+    def _resolve_ollama_endpoint(raw_endpoint: str | None) -> tuple[str, str]:
+        raw = (raw_endpoint or "http://localhost:11434").rstrip("/")
+        path = urlparse(raw).path.rstrip("/")
+        if path.endswith("/api/chat") or path.endswith("/chat"):
+            return raw, "chat"
+        if path.endswith("/api/generate") or path.endswith("/generate"):
+            return raw, "generate"
+        return f"{raw}/api/generate", "generate"
+
+    @staticmethod
     def _post_json(
         url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int = 120
     ) -> dict[str, Any]:
@@ -249,19 +259,28 @@ class LocalLLMAIClient(StubAIClient):
             raise
 
     async def _respond_ollama(self, request: AIRequest) -> AIResponse:
-        endpoint = (request.get("endpoint") or "http://localhost:11434").rstrip(
-            "/"
-        ) + "/api/generate"
-        data = self._post_json(
-            endpoint,
-            {
+        endpoint, endpoint_type = self._resolve_ollama_endpoint(request.get("endpoint"))
+        if endpoint_type == "chat":
+            payload = {
+                "model": request["model_name"],
+                "messages": self._build_messages(request),
+                "stream": False,
+            }
+        else:
+            payload = {
                 "model": request["model_name"],
                 "prompt": self._build_prompt_text(request),
                 "stream": False,
-            },
+            }
+        data = self._post_json(
+            endpoint,
+            payload,
             {"Content-Type": "application/json"},
         )
-        content = data.get("response")
+        if endpoint_type == "chat":
+            content = data.get("message", {}).get("content")
+        else:
+            content = data.get("response")
         if not content:
             raise ValueError("empty Ollama response")
         return {
@@ -370,14 +389,19 @@ class LocalLLMAIClient(StubAIClient):
         self,
         request: AIRequest,
     ) -> AsyncGenerator[str, None]:
-        endpoint = (request.get("endpoint") or "http://localhost:11434").rstrip(
-            "/"
-        ) + "/api/generate"
-        payload = {
-            "model": request["model_name"],
-            "prompt": self._build_prompt_text(request),
-            "stream": True,
-        }
+        endpoint, endpoint_type = self._resolve_ollama_endpoint(request.get("endpoint"))
+        if endpoint_type == "chat":
+            payload = {
+                "model": request["model_name"],
+                "messages": self._build_messages(request),
+                "stream": True,
+            }
+        else:
+            payload = {
+                "model": request["model_name"],
+                "prompt": self._build_prompt_text(request),
+                "stream": True,
+            }
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/x-ndjson",
@@ -408,7 +432,10 @@ class LocalLLMAIClient(StubAIClient):
                             chunk = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        token = chunk.get("response")
+                        if endpoint_type == "chat":
+                            token = chunk.get("message", {}).get("content")
+                        else:
+                            token = chunk.get("response")
                         if isinstance(token, str) and token:
                             count += 1
                             yield token

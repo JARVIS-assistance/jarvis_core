@@ -70,7 +70,14 @@ Planning rules:
 - If a request opens/focuses an app and asks JARVIS to write/create/compose
   content there, keep that as separate ordered steps: open/focus the app,
   compose the final content, then type or paste the final content.
-- For **information/search requests** (weather, news, prices, general knowledge):
+- Use web_search only when the user explicitly asks to search/browse/open a
+  web page, or when the answer depends on real-time/local facts such as weather,
+  news, prices, stock quotes, exchange rates, operating hours, or current
+  availability.
+- Recommendation, advice, brainstorming, menu suggestions, and casual follow-ups
+  are answer-generation requests. Do not plan web_search or browser actions for
+  them unless the user explicitly asks to search or open the browser.
+- For explicit search/live-information requests:
   1. web_search step to retrieve the information
   2. notify step to present the summarized result to the user
   Keep it simple — usually 2 steps is enough.
@@ -114,7 +121,7 @@ Include actions in a JSON array fenced with ```actions ... ```.
 1. **Logical tasks** (terminal, file, app, search): execute directly, no screenshot needed.
 2. **Web page tasks**: if clicking or typing inside the current page is needed, emit `browser_control` command `extract_dom` first. Use `click_element` or `type_element` only after DOM results provide an `ai_id`.
 3. **Physical tasks** (GUI click, type in app): if coordinates are unknown and DOM control is not applicable, emit a `screenshot` action first. The next step will receive the screenshot result for coordinate analysis.
-4. **Search tasks**: emit `web_search` action. The server will execute the search and inject results into the next step's context automatically. Do NOT try to answer the question yourself — just emit the search action.
+4. **Search tasks**: emit `web_search` only when the current step explicitly requires web search or live facts. For recommendation, advice, brainstorming, menu suggestions, and casual follow-ups, answer directly without actions unless the user explicitly asks to search/browse/open a page. The server will execute the search and inject results into the next step's context automatically.
 5. `requires_confirm`: true for destructive operations (delete, overwrite, install). false for reads, screenshots, notifications, searches.
 6. `description`: human-readable explanation in the user's language.
 7. Your analysis text should come BEFORE the ```actions``` block.
@@ -178,6 +185,14 @@ Notify user with search results:
 ```
 """
 
+_SUMMARIZE_SYSTEM_PROMPT_FALLBACK = (
+    "You are JARVIS. "
+    "Summarize the search results concisely "
+    "and answer the user's question directly. "
+    "Respond in the same language as the user's request. "
+    "Do NOT include action blocks."
+)
+
 
 def _get_planning_prompt() -> str:
     loaded = _load_prompt("deepthink_planning")
@@ -191,13 +206,7 @@ def _get_execution_prompt() -> str:
 
 def _get_summarize_prompt() -> str:
     loaded = _load_prompt("deepthink_summarize")
-    return loaded if loaded else (
-        "You are JARVIS. "
-        "Summarize the search results concisely "
-        "and answer the user's question directly. "
-        "Respond in the same language as the user's request. "
-        "Do NOT include action blocks."
-    )
+    return loaded if loaded else _SUMMARIZE_SYSTEM_PROMPT_FALLBACK
 
 
 def _parse_actions_from_content(
