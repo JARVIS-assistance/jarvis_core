@@ -10,7 +10,7 @@ from .common import now_iso
 DEFAULT_PERSONA_NAME = "Default Persona"
 DEFAULT_PERSONA_DESCRIPTION = "Auto-created default persona per user."
 DEFAULT_PERSONA_PROMPT = (
-    "You are Jarvis, a practical and concise assistant for this user."
+    "Use the base JARVIS style. Be natural, warm, concise, and conversational."
 )
 DEFAULT_PERSONA_TONE = "balanced"
 DEFAULT_PERSONA_ALIAS = "default"
@@ -205,6 +205,7 @@ def get_selected_persona_for_user(db: DBClient, user_id: str) -> dict[str, Any] 
             JOIN personas p ON p.id = up.persona_id
             WHERE c.user_id = %s
               AND c.status = 'ACTIVE'
+              AND p.is_active = true
             ORDER BY c.last_message_at DESC
             LIMIT 1
             """,
@@ -228,10 +229,68 @@ def get_selected_persona_for_user(db: DBClient, user_id: str) -> dict[str, Any] 
             JOIN personas p ON p.id = up.persona_id
             WHERE c.user_id = ?
               AND c.status = 'ACTIVE'
+              AND p.is_active = 1
             ORDER BY c.last_message_at DESC
             LIMIT 1
             """,
             (user_id,),
+        )
+    row = cursor.fetchone()
+    if row is not None:
+        return _map_persona_row(row)
+    return _get_first_active_persona_for_user(db, user_id=user_id)
+
+
+def _get_first_active_persona_for_user(
+    db: DBClient, *, user_id: str
+) -> dict[str, Any] | None:
+    if db.backend == "postgres":
+        cursor = db.conn.execute(
+            """
+            SELECT
+                up.id,
+                p.id,
+                p.name,
+                p.description,
+                p.prompt_template,
+                p.tone,
+                up.alias,
+                p.is_active,
+                false AS is_selected
+            FROM user_personas up
+            JOIN personas p ON p.id = up.persona_id
+            WHERE up.user_id = %s
+              AND p.is_active = true
+            ORDER BY
+                CASE WHEN up.alias = %s THEN 1 ELSE 0 END,
+                p.name ASC
+            LIMIT 1
+            """,
+            (user_id, DEFAULT_PERSONA_ALIAS),
+        )
+    else:
+        cursor = db.conn.execute(
+            """
+            SELECT
+                up.id,
+                p.id,
+                p.name,
+                p.description,
+                p.prompt_template,
+                p.tone,
+                up.alias,
+                p.is_active,
+                0 AS is_selected
+            FROM user_personas up
+            JOIN personas p ON p.id = up.persona_id
+            WHERE up.user_id = ?
+              AND p.is_active = 1
+            ORDER BY
+                CASE WHEN up.alias = ? THEN 1 ELSE 0 END,
+                p.name ASC
+            LIMIT 1
+            """,
+            (user_id, DEFAULT_PERSONA_ALIAS),
         )
     row = cursor.fetchone()
     if row is None:

@@ -22,7 +22,9 @@ def create_user(
     now = now_iso()
     persona_name = "Default Persona"
     persona_description = "Auto-created default persona per user."
-    persona_prompt = "You are Jarvis, a practical and concise assistant for this user."
+    persona_prompt = (
+        "Use the base JARVIS style. Be natural, warm, concise, and conversational."
+    )
     persona_tone = "balanced"
     persona_alias = "default"
 

@@ -173,7 +173,8 @@ def test_realtime_request_uses_workbench_base_prompt() -> None:
     assert response.status_code == 200
     system_prompt = str(ai_client.requests[-1]["system_prompt"])
     assert "진행하겠습니다!" in system_prompt
-    assert "Do not explain that you cannot operate the screen" in system_prompt
+    assert "Sound like a real person in a messenger chat" in system_prompt
+    assert "answer directly in-character first" in system_prompt
 
 
 def test_realtime_stream_marks_latest_user_message_as_current_turn() -> None:
@@ -214,6 +215,59 @@ def test_realtime_stream_marks_latest_user_message_as_current_turn() -> None:
     assert "sublimetext켜서 안녕하세요 작성해볼래?" in latest["content"]
     assert "점심 메뉴 추천" not in latest["content"]
     assert "Current-turn priority" in str(ai_client.requests[-1]["system_prompt"])
+
+
+def test_realtime_stream_uses_existing_user_persona_without_chat_selection() -> None:
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        db = connect(db_file.name)
+        app = create_app(db=db, ai_service=ai_service)
+        with TestClient(app) as client:
+            persona_response = client.post(
+                "/internal/chat/persona",
+                json={
+                    "name": "Casual Friend",
+                    "description": "친근한 친구 톤",
+                    "prompt_template": "친구처럼 짧고 자연스럽게 말해.",
+                    "tone": "casual",
+                    "alias": "friend",
+                },
+                headers={"x-user-id": "u-persona-fallback"},
+            )
+            assert persona_response.status_code == 200
+            db.conn.execute(
+                """
+                UPDATE chats
+                SET last_selected_user_persona_id = NULL
+                WHERE user_id = ?
+                """,
+                ("u-persona-fallback",),
+            )
+            db.conn.commit()
+
+            with client.stream(
+                "POST",
+                "/internal/chat/stream",
+                json={"message": "안녕?", "route_override": "realtime"},
+                headers={
+                    "x-user-id": "u-persona-fallback",
+                    "x-user-email": "u-persona-fallback@example.com",
+                    "x-request-id": "r-persona-fallback",
+                },
+            ) as response:
+                body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "assistant_delta" in body
+    system_prompt = str(ai_client.requests[-1]["system_prompt"])
+    assert "친구처럼 짧고 자연스럽게 말해." in system_prompt
+    assert "Tone: casual" in system_prompt
 
 
 def test_realtime_stream_prefers_selected_realtime_model_over_default(caplog) -> None:
