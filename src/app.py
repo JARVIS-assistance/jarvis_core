@@ -51,7 +51,17 @@ logging.basicConfig(level=logging.INFO)
 
 
 def _get_chat_service(app: FastAPI) -> ChatService:
-    return ChatService(db=app.state.db, ai_service=app.state.ai_service)
+    service = getattr(app.state, "chat_service", None)
+    if isinstance(service, ChatService):
+        return service
+    if not hasattr(app.state, "db") or app.state.db is None:
+        app.state.db = connect()
+        init_db(app.state.db)
+    if not hasattr(app.state, "ai_service") or app.state.ai_service is None:
+        app.state.ai_service = AIService(default_client=StubAIClient())
+    service = ChatService(db=app.state.db, ai_service=app.state.ai_service)
+    app.state.chat_service = service
+    return service
 
 
 def _get_deepthink_service(app: FastAPI) -> DeepThinkService:
@@ -71,7 +81,11 @@ def create_app(db: DBClient | None = None, ai_service: AIService | None = None) 
             app.state.ai_service = ai_service or AIService(default_client=StubAIClient())
 
     @app.on_event("shutdown")
-    def shutdown() -> None:
+    async def shutdown() -> None:
+        ai = getattr(app.state, "ai_service", None)
+        close = getattr(ai, "close", None)
+        if callable(close):
+            await close()
         db_client: DBClient | None = getattr(app.state, "db", None)
         if db_client is not None:
             db_client.conn.close()

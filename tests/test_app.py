@@ -1,11 +1,14 @@
+import json
 import logging
 from tempfile import NamedTemporaryFile
+from textwrap import dedent
 
 from fastapi.testclient import TestClient
 from jarvis_contracts import JarvisCoreEndpoints
 
 from ai import AIService
 from app import create_app
+from application.chat.service import _build_alternating_messages, _build_messages_for_model
 from core.config.prompt_loader import load_prompt
 from core.db.db_connection import connect
 
@@ -149,7 +152,40 @@ def test_runtime_profile_preserves_application_routing_metadata() -> None:
             assert app_profile["keywords"] == ["오늘 날씨", "지역 날씨"]
 
 
-def test_realtime_request_uses_workbench_base_prompt() -> None:
+def test_runtime_profile_preserves_terminal_policy_metadata() -> None:
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name))
+        with TestClient(app) as client:
+            response = client.put(
+                JarvisCoreEndpoints.INTERNAL_CLIENT_RUNTIME_PROFILE.path,
+                json={
+                    "platform": "macos",
+                    "capabilities": ["terminal.run"],
+                    "terminal": {
+                        "enabled": True,
+                        "shell": "zsh",
+                        "cwd": "/Users/chawonje/Desktop/Workspace/project/JARVIS",
+                        "allowed_commands": ["echo", "pwd", "ls", "git status"],
+                        "allowed_cwds": [
+                            "/Users/chawonje/Desktop/Workspace/project/JARVIS"
+                        ],
+                        "timeout_seconds": 20,
+                    },
+                },
+                headers={"x-user-id": "u-runtime-terminal"},
+            )
+
+            assert response.status_code == 200
+            terminal = response.json()["terminal"]
+            assert terminal["enabled"] is True
+            assert terminal["allowed_commands"] == ["echo", "pwd", "ls", "git status"]
+            assert terminal["allowed_cwds"] == [
+                "/Users/chawonje/Desktop/Workspace/project/JARVIS"
+            ]
+
+
+def test_realtime_request_uses_workbench_base_prompt(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_OLLAMA_REALTIME_COMPACT_PROMPT", "0")
     ai_client = RecordingAIClient()
     ai_service = AIService(
         default_client=ai_client,
@@ -175,6 +211,144 @@ def test_realtime_request_uses_workbench_base_prompt() -> None:
     assert "진행하겠습니다!" in system_prompt
     assert "Sound like a real person in a messenger chat" in system_prompt
     assert "answer directly in-character first" in system_prompt
+
+
+def test_ollama_realtime_stream_uses_workbench_realtime_prompt(monkeypatch) -> None:
+    def fake_prompt_load(key: str) -> str | None:
+        assert key == "realtime_system"
+        return "Workbench realtime prompt. 짧게 답해."
+
+    monkeypatch.setattr("application.chat.service._load_prompt", fake_prompt_load)
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            with client.stream(
+                "POST",
+                "/internal/chat/stream",
+                json={"message": "안녕?", "route_override": "realtime"},
+                headers={
+                    "x-user-id": "u-compact-prompt",
+                    "x-user-email": "u-compact-prompt@example.com",
+                    "x-request-id": "r-compact-prompt",
+                },
+            ) as response:
+                body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "assistant_delta" in body
+    system_prompt = str(ai_client.requests[-1]["system_prompt"])
+    assert system_prompt == "Workbench realtime prompt. 짧게 답해."
+    assert "Current-turn priority" not in system_prompt
+
+
+def test_ollama_realtime_prompt_reflects_yaml_updates(monkeypatch, tmp_path) -> None:
+    prompts_path = tmp_path / "prompts.yaml"
+    prompts_path.write_text(
+        dedent(
+            """
+            version: 1
+            prompts:
+              realtime_system:
+                name: Realtime
+                description: test
+                content: 첫 번째 realtime prompt
+            """
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("JARVIS_PROMPTS_YAML", str(prompts_path))
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            for content in ("첫 번째 realtime prompt", "두 번째 realtime prompt"):
+                prompts_path.write_text(
+                    dedent(
+                        f"""
+                        version: 1
+                        prompts:
+                          realtime_system:
+                            name: Realtime
+                            description: test
+                            content: {content}
+                        """
+                    ),
+                    encoding="utf-8",
+                )
+                with client.stream(
+                    "POST",
+                    "/internal/chat/stream",
+                    json={"message": "안녕?", "route_override": "realtime"},
+                    headers={
+                        "x-user-id": "u-live-prompt",
+                        "x-user-email": "u-live-prompt@example.com",
+                        "x-request-id": f"r-live-prompt-{len(ai_client.requests)}",
+                    },
+                ) as response:
+                    body = "".join(response.iter_text())
+                assert response.status_code == 200
+                assert "assistant_delta" in body
+                assert ai_client.requests[-1]["system_prompt"] == content
+
+
+def test_ollama_realtime_prompt_preserves_long_yaml_content(monkeypatch, tmp_path) -> None:
+    long_prompt = "긴 realtime prompt\n" + ("보존해야 하는 시스템 규칙입니다.\n" * 2500)
+    prompts_path = tmp_path / "prompts.yaml"
+    prompts_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "prompts": {
+                    "realtime_system": {
+                        "name": "Realtime",
+                        "description": "long prompt test",
+                        "content": long_prompt,
+                    }
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("JARVIS_PROMPTS_YAML", str(prompts_path))
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            with client.stream(
+                "POST",
+                "/internal/chat/stream",
+                json={"message": "안녕?", "route_override": "realtime"},
+                headers={
+                    "x-user-id": "u-long-prompt",
+                    "x-user-email": "u-long-prompt@example.com",
+                    "x-request-id": "r-long-prompt",
+                },
+            ) as response:
+                body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "assistant_delta" in body
+    assert ai_client.requests[-1]["system_prompt"] == long_prompt
 
 
 def test_realtime_stream_marks_latest_user_message_as_current_turn() -> None:
@@ -217,7 +391,46 @@ def test_realtime_stream_marks_latest_user_message_as_current_turn() -> None:
     assert "Current-turn priority" in str(ai_client.requests[-1]["system_prompt"])
 
 
-def test_realtime_stream_uses_existing_user_persona_without_chat_selection() -> None:
+def test_latest_user_message_does_not_create_consecutive_user_turns() -> None:
+    messages = _build_alternating_messages(
+        system_prompt="system",
+        context_messages=[
+            {"role": "user", "content": "브라우저 열어서 네이버 웹툰 페이지 열어줘"},
+            {"role": "user", "content": "안녕?"},
+        ],
+        user_message="안녕?",
+    )
+
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert messages[-1]["content"].startswith("Latest user message.")
+    assert "브라우저 열어서 네이버 웹툰 페이지 열어줘" not in messages[-1]["content"]
+
+
+def test_ollama_realtime_uses_compact_current_turn_messages() -> None:
+    system_prompt, messages = _build_messages_for_model(
+        system_prompt="long workbench system prompt",
+        context_messages=[
+            {"role": "user", "content": "이전 질문"},
+            {"role": "assistant", "content": "이전 답변"},
+        ],
+        user_message="안녕?",
+        route="realtime",
+        selected_model={"provider_name": "ollama", "model_name": "gemma4:e2b"},
+    )
+
+    assert system_prompt is not None
+    assert len(system_prompt) < 200
+    assert "JARVIS" in system_prompt
+    assert messages == [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "안녕?"},
+    ]
+
+
+def test_realtime_stream_uses_existing_user_persona_without_chat_selection(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_OLLAMA_REALTIME_COMPACT_PROMPT", "0")
     ai_client = RecordingAIClient()
     ai_service = AIService(
         default_client=ai_client,
@@ -266,8 +479,113 @@ def test_realtime_stream_uses_existing_user_persona_without_chat_selection() -> 
     assert response.status_code == 200
     assert "assistant_delta" in body
     system_prompt = str(ai_client.requests[-1]["system_prompt"])
+    assert "Realtime persona override" in system_prompt
     assert "친구처럼 짧고 자연스럽게 말해." in system_prompt
-    assert "Tone: casual" in system_prompt
+    assert "Persona tone: casual" in system_prompt
+
+
+def test_ollama_realtime_compact_prompt_includes_selected_persona(monkeypatch) -> None:
+    monkeypatch.delenv("JARVIS_OLLAMA_REALTIME_COMPACT_PROMPT", raising=False)
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            persona_response = client.post(
+                "/internal/chat/persona",
+                json={
+                    "name": "Casual Friend",
+                    "description": "친근한 친구 톤",
+                    "prompt_template": "친구처럼 짧고 자연스럽게 말해.",
+                    "tone": "casual",
+                    "alias": "friend",
+                },
+                headers={"x-user-id": "u-compact-persona"},
+            )
+            assert persona_response.status_code == 200
+            select_response = client.post(
+                "/internal/chat/persona/select",
+                json={"user_persona_id": persona_response.json()["user_persona_id"]},
+                headers={"x-user-id": "u-compact-persona"},
+            )
+            assert select_response.status_code == 200
+            assert select_response.json()["is_selected"] is True
+
+            with client.stream(
+                "POST",
+                "/internal/chat/stream",
+                json={"message": "안녕?", "route_override": "realtime"},
+                headers={
+                    "x-user-id": "u-compact-persona",
+                    "x-user-email": "u-compact-persona@example.com",
+                    "x-request-id": "r-compact-persona",
+                },
+            ) as response:
+                body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "assistant_delta" in body
+    system_prompt = str(ai_client.requests[-1]["system_prompt"])
+    assert "Realtime persona override" in system_prompt
+    assert "친구처럼 짧고 자연스럽게 말해." in system_prompt
+    assert "Persona tone: casual" in system_prompt
+    assert ai_client.requests[-1]["messages"] == [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "안녕?"},
+    ]
+
+
+def test_deep_chat_does_not_apply_user_persona(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_OLLAMA_REALTIME_COMPACT_PROMPT", "0")
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            persona_response = client.post(
+                "/internal/chat/persona",
+                json={
+                    "name": "Only Realtime",
+                    "description": "deep에는 적용하지 않는다",
+                    "prompt_template": "반드시 장난스럽게 말해.",
+                    "tone": "playful",
+                    "alias": "realtime-only",
+                },
+                headers={"x-user-id": "u-deep-no-persona"},
+            )
+            assert persona_response.status_code == 200
+            select_response = client.post(
+                "/internal/chat/persona/select",
+                json={"user_persona_id": persona_response.json()["user_persona_id"]},
+                headers={"x-user-id": "u-deep-no-persona"},
+            )
+            assert select_response.status_code == 200
+
+            response = client.post(
+                "/internal/chat/request",
+                json={"message": "분석해줘", "route_override": "deep"},
+                headers={
+                    "x-user-id": "u-deep-no-persona",
+                    "x-user-email": "u-deep-no-persona@example.com",
+                    "x-request-id": "r-deep-no-persona",
+                },
+            )
+
+    assert response.status_code == 200
+    system_prompt = str(ai_client.requests[-1]["system_prompt"])
+    assert "반드시 장난스럽게 말해." not in system_prompt
+    assert "Persona tone: playful" not in system_prompt
+    assert "Realtime persona override" not in system_prompt
 
 
 def test_realtime_stream_prefers_selected_realtime_model_over_default(caplog) -> None:
@@ -543,43 +861,42 @@ def test_realtime_stream_prefers_realtime_capable_model_without_selection() -> N
 
 
 def test_internal_persona_and_memory_endpoints() -> None:
-    client = TestClient(create_app())
+    with TestClient(create_app()) as client:
+        persona_response = client.post(
+            "/internal/chat/persona",
+            json={
+                "name": "Architect",
+                "description": "Focus on design",
+                "prompt_template": "You are Jarvis acting as a careful architect.",
+                "tone": "analytical",
+                "alias": "architect",
+            },
+            headers={"x-user-id": "u1"},
+        )
+        assert persona_response.status_code == 200
+        persona = persona_response.json()
+        assert persona["name"] == "Architect"
 
-    persona_response = client.post(
-        "/internal/chat/persona",
-        json={
-            "name": "Architect",
-            "description": "Focus on design",
-            "prompt_template": "You are Jarvis acting as a careful architect.",
-            "tone": "analytical",
-            "alias": "architect",
-        },
-        headers={"x-user-id": "u1"},
-    )
-    assert persona_response.status_code == 200
-    persona = persona_response.json()
-    assert persona["name"] == "Architect"
+        memory_response = client.post(
+            "/internal/chat/memory",
+            json={
+                "type": "preference",
+                "content": "Prefer concise Korean answers.",
+                "importance": 5,
+            },
+            headers={"x-user-id": "u1"},
+        )
+        assert memory_response.status_code == 200
+        memory = memory_response.json()
+        assert memory["type"] == "preference"
 
-    memory_response = client.post(
-        "/internal/chat/memory",
-        json={
-            "type": "preference",
-            "content": "Prefer concise Korean answers.",
-            "importance": 5,
-        },
-        headers={"x-user-id": "u1"},
-    )
-    assert memory_response.status_code == 200
-    memory = memory_response.json()
-    assert memory["type"] == "preference"
+        list_response = client.get("/internal/chat/persona", headers={"x-user-id": "u1"})
+        assert list_response.status_code == 200
+        assert len(list_response.json()) >= 1
 
-    list_response = client.get("/internal/chat/persona", headers={"x-user-id": "u1"})
-    assert list_response.status_code == 200
-    assert len(list_response.json()) >= 1
-
-    memory_list_response = client.get("/internal/chat/memory", headers={"x-user-id": "u1"})
-    assert memory_list_response.status_code == 200
-    assert len(memory_list_response.json()) >= 1
+        memory_list_response = client.get("/internal/chat/memory", headers={"x-user-id": "u1"})
+        assert memory_list_response.status_code == 200
+        assert len(memory_list_response.json()) >= 1
 
 
 def test_deepthink_uses_memory_and_saves_user_message() -> None:

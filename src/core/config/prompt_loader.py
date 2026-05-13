@@ -6,10 +6,10 @@ yaml 파일이 없거나 해당 키가 없으면 None을 반환하여
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger("jarvis_core.prompt_loader")
 
@@ -44,10 +44,14 @@ def load_prompt(key: str) -> str | None:
         return None
 
     try:
-        import yaml
-
         with path.open("r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            raw = f.read()
+        try:
+            import yaml
+
+            data = yaml.safe_load(raw) or {}
+        except ModuleNotFoundError:
+            data = json.loads(raw)
 
         prompt = data.get("prompts", {}).get(key)
         if prompt is None:
@@ -71,10 +75,14 @@ def load_all_prompts() -> dict[str, str]:
         return {}
 
     try:
-        import yaml
-
         with path.open("r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            raw = f.read()
+        try:
+            import yaml
+
+            data = yaml.safe_load(raw) or {}
+        except ModuleNotFoundError:
+            data = json.loads(raw)
 
         result: dict[str, str] = {}
         for key, val in data.get("prompts", {}).items():

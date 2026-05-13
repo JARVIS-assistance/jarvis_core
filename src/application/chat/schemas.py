@@ -127,6 +127,8 @@ class TerminalProfile(BaseModel):
     shell_path: str | None = None
     cwd: str | None = None
     env: dict[str, str] = Field(default_factory=dict)
+    allowed_commands: list[str] = Field(default_factory=list)
+    allowed_cwds: list[str] = Field(default_factory=list)
     supports_pty: bool = False
     requires_confirm: bool = True
     timeout_seconds: int = Field(default=30, ge=1, le=600)

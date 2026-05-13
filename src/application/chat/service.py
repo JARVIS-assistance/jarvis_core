@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncGenerator
 from uuid import uuid4
 
@@ -165,17 +166,108 @@ def _build_alternating_messages(
         else:
             messages.append({"role": role, "content": content})
 
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                "Latest user message. Respond to this message, not to the previous topic, "
-                "unless this message explicitly refers back to it:\n"
-                f"{user_message}"
-            ),
-        }
-    )
+    # Some local chat templates, including small Ollama models, can emit an empty
+    # response when the message list contains consecutive user turns.
+    while messages and messages[-1]["role"] == "user":
+        messages.pop()
+
+    messages.append({"role": "user", "content": _latest_user_message_content(user_message)})
     return messages
+
+
+def _latest_user_message_content(user_message: str) -> str:
+    return (
+        "Latest user message. Respond to this message, not to the previous topic, "
+        "unless this message explicitly refers back to it:\n"
+        f"{user_message}"
+    )
+
+
+_OLLAMA_PROVIDER_NAMES = {
+    "ollama",
+    "ollama_chat",
+    "ollama-generate",
+    "ollma",
+    "ollmahost",
+}
+
+
+_REALTIME_COMPACT_SYSTEM_PROMPT = (
+    "너는 JARVIS. 한국어로 짧게 답해. "
+    "컴퓨터 조작 요청은 '진행하겠습니다!'만 출력."
+)
+
+
+def _get_realtime_system_prompt() -> str:
+    loaded = _load_prompt("realtime_system")
+    if loaded and loaded.strip():
+        return loaded
+    return _REALTIME_COMPACT_SYSTEM_PROMPT
+
+
+def _is_ollama_provider_name(provider_name: object) -> bool:
+    normalized = str(provider_name or "").strip().lower().replace(" ", "_")
+    return normalized in _OLLAMA_PROVIDER_NAMES
+
+
+def _use_compact_realtime_messages(route: str, provider_name: object) -> bool:
+    if route != "realtime" or not _is_ollama_provider_name(provider_name):
+        return False
+    raw = os.getenv("JARVIS_OLLAMA_REALTIME_COMPACT_PROMPT", "1").strip().lower()
+    return raw not in {"0", "false", "no"}
+
+
+def _is_default_persona(persona: dict[str, object]) -> bool:
+    return (
+        str(persona.get("alias") or "").strip().lower() == "default"
+        and str(persona.get("name") or "").strip() == "Default Persona"
+    )
+
+
+def _realtime_persona_prompt_parts(persona: dict[str, object] | None) -> list[str]:
+    if not persona or _is_default_persona(persona):
+        return []
+
+    prompt_template = persona.get("prompt_template")
+    parts: list[str] = []
+    if isinstance(prompt_template, str) and prompt_template.strip():
+        parts.append(
+            "## Realtime persona override\n"
+            "Follow this persona for voice, tone, wording, and conversational behavior. "
+            "When base style and this persona differ, use this persona unless it conflicts "
+            "with safety or client action protocol.\n"
+            f"{prompt_template.strip()}"
+        )
+
+    tone = persona.get("tone")
+    if isinstance(tone, str) and tone.strip():
+        parts.append(f"Persona tone: {tone.strip()}")
+    return parts
+
+
+def _build_messages_for_model(
+    *,
+    system_prompt: str | None,
+    context_messages: list[dict[str, str]],
+    user_message: str,
+    route: str,
+    selected_model: dict[str, object],
+) -> tuple[str | None, list[dict[str, str]]]:
+    if _use_compact_realtime_messages(route, selected_model.get("provider_name")):
+        realtime_prompt = (
+            system_prompt
+            if system_prompt and not context_messages
+            else _get_realtime_system_prompt()
+        )
+        return realtime_prompt, [
+            {"role": "system", "content": realtime_prompt},
+            {"role": "user", "content": _latest_user_message_content(user_message)},
+        ]
+    return system_prompt, _build_alternating_messages(
+        system_prompt=system_prompt,
+        context_messages=context_messages,
+        user_message=user_message,
+    )
 
 
 def _recent_context_limit(route: str) -> int:
@@ -191,23 +283,110 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _realtime_context_cache_ttl_seconds() -> int:
+    return _int_env("JARVIS_REALTIME_CONTEXT_CACHE_TTL_SECONDS", 20)
+
+
+def _rollback_failed_transaction(db: DBClient) -> None:
+    rollback = getattr(db.conn, "rollback", None)
+    if not callable(rollback):
+        return
+    try:
+        rollback()
+    except Exception:
+        logger.exception("[chat] failed to rollback db transaction")
+
+
 class ChatService:
     def __init__(self, db: DBClient, ai_service: AIService) -> None:
         self.db = db
         self.ai_service = ai_service
+        self._realtime_model_cache: dict[
+            str, tuple[float, dict[str, str | bool | None]]
+        ] = {}
+        self._realtime_persona_parts_cache: dict[str, tuple[float, list[str]]] = {}
+
+    def _cached_until(self) -> float:
+        ttl = _realtime_context_cache_ttl_seconds()
+        if ttl <= 0:
+            return 0.0
+        return time.monotonic() + ttl
+
+    def _is_cache_entry_valid(self, expires_at: float) -> bool:
+        return expires_at > time.monotonic()
+
+    def _invalidate_realtime_cache(self, user_id: str) -> None:
+        self._realtime_model_cache.pop(user_id, None)
+        self._realtime_persona_parts_cache.pop(user_id, None)
+
+    def _remember_model_config(
+        self,
+        *,
+        user_id: str,
+        purpose: str,
+        model: dict[str, str | bool | None],
+    ) -> dict[str, str | bool | None]:
+        if purpose == "realtime":
+            expires_at = self._cached_until()
+            if expires_at:
+                self._realtime_model_cache[user_id] = (expires_at, dict(model))
+        return model
+
+    def _cached_realtime_persona_parts(self, user_id: str) -> list[str]:
+        cached = self._realtime_persona_parts_cache.get(user_id)
+        if cached is not None:
+            expires_at, parts = cached
+            if self._is_cache_entry_valid(expires_at):
+                return list(parts)
+
+        persona = get_selected_persona_for_user(self.db, user_id=user_id)
+        if persona is None:
+            persona = ensure_default_persona_for_user(self.db, user_id=user_id)
+        parts = _realtime_persona_prompt_parts(persona)
+        expires_at = self._cached_until()
+        if expires_at:
+            self._realtime_persona_parts_cache[user_id] = (expires_at, list(parts))
+        return parts
+
+    def _compact_prompt_context_for_model(
+        self,
+        *,
+        route: str,
+        selected_model: dict[str, object],
+        user_id: str | None = None,
+    ) -> tuple[str | None, list[dict[str, str]]] | None:
+        if not _use_compact_realtime_messages(
+            route,
+            selected_model.get("provider_name"),
+        ):
+            return None
+        system_parts = [_get_realtime_system_prompt()]
+        if user_id:
+            try:
+                system_parts.extend(self._cached_realtime_persona_parts(user_id))
+            except Exception:
+                logger.exception(
+                    "[chat] failed to load compact realtime persona user=%s",
+                    user_id,
+                )
+        realtime_prompt = "\n\n".join(system_parts)
+        return realtime_prompt, [{"role": "system", "content": realtime_prompt}]
 
     def _fallback_model_config(self) -> dict[str, str | bool | None]:
         return {
             "id": "default-local",
             "provider_mode": "local",
-            "provider_name": "local-default",
-            "model_name": "local-stub",
+            "provider_name": os.getenv("JARVIS_FALLBACK_PROVIDER_NAME", "ollama"),
+            "model_name": os.getenv("JARVIS_FALLBACK_MODEL_NAME", "qwen2.5:1.5b"),
             "api_key": None,
-            "endpoint": None,
+            "endpoint": os.getenv(
+                "JARVIS_FALLBACK_MODEL_ENDPOINT",
+                "http://host.docker.internal:3030/chat",
+            ),
             "is_active": True,
             "is_default": True,
             "supports_stream": True,
-            "supports_realtime": False,
+            "supports_realtime": True,
             "transport": "http_sse",
             "input_modalities": "text",
             "output_modalities": "text",
@@ -216,6 +395,13 @@ class ChatService:
     def _select_model_config(
         self, user_id: str, purpose: str
     ) -> dict[str, str | bool | None]:
+        if purpose == "realtime":
+            cached = self._realtime_model_cache.get(user_id)
+            if cached is not None:
+                expires_at, model = cached
+                if self._is_cache_entry_valid(expires_at):
+                    return dict(model)
+
         selected_id: str | None = None
         selection = get_user_ai_selection(self.db, user_id=user_id)
         if selection is not None:
@@ -243,7 +429,11 @@ class ChatService:
                         selected_model["id"],
                         user_id,
                     )
-                    return selected_model
+                    return self._remember_model_config(
+                        user_id=user_id,
+                        purpose=purpose,
+                        model=selected_model,
+                    )
                 logger.info(
                     "[chat] selected realtime model ignored because supports_realtime=false "
                     "model=%s config_id=%s user=%s",
@@ -266,7 +456,11 @@ class ChatService:
                     realtime_config["id"],
                     user_id,
                 )
-                return realtime_config
+                return self._remember_model_config(
+                    user_id=user_id,
+                    purpose=purpose,
+                    model=realtime_config,
+                )
 
         default_config = get_active_model_for_user(self.db, user_id=user_id)
         if default_config is not None and bool(default_config.get("is_default", False)):
@@ -279,7 +473,11 @@ class ChatService:
                 default_config["id"],
                 user_id,
             )
-            return default_config
+            return self._remember_model_config(
+                user_id=user_id,
+                purpose=purpose,
+                model=default_config,
+            )
 
         result = default_config or {**self._fallback_model_config()}
         logger.info(
@@ -290,7 +488,11 @@ class ChatService:
             result.get("model_name"),
             user_id,
         )
-        return result
+        return self._remember_model_config(
+            user_id=user_id,
+            purpose=purpose,
+            model=result,
+        )
 
     def _resolve_route(self, message: str, task_type: str, route_override: str | None) -> str:
         if route_override in {"realtime", "deep"}:
@@ -301,9 +503,11 @@ class ChatService:
         self, *, user_id: str, chat_id: str, route: str
     ) -> tuple[str | None, list[dict[str, str]]]:
         settings = ensure_user_settings(self.db, user_id=user_id)
-        persona = get_selected_persona_for_user(self.db, user_id=user_id)
-        if persona is None:
-            persona = ensure_default_persona_for_user(self.db, user_id=user_id)
+        persona = None
+        if route == "realtime":
+            persona = get_selected_persona_for_user(self.db, user_id=user_id)
+            if persona is None:
+                persona = ensure_default_persona_for_user(self.db, user_id=user_id)
 
         memories = list_memory_items(self.db, user_id=user_id, chat_id=chat_id, limit=5)
         summary = get_latest_chat_summary(self.db, chat_id=chat_id)
@@ -323,8 +527,6 @@ class ChatService:
         )
         system_parts = [
             _get_base_system_prompt(),
-            f"## Persona\n{persona['prompt_template']}",
-            f"Tone: {persona['tone'] or 'balanced'}",
             f"Route mode: {route}",
             f"User locale: {settings['locale']}",
             f"User timezone: {settings['timezone']}",
@@ -333,6 +535,8 @@ class ChatService:
             "Current-turn priority: answer or execute the latest user message. "
             "Do not continue a previous topic unless the latest message clearly refers to it.",
         ]
+        if route == "realtime":
+            system_parts.extend(_realtime_persona_prompt_parts(persona))
         if persona_hint:
             system_parts.append(f"Persona hint from user settings: {persona_hint}")
         if custom_instructions:
@@ -368,13 +572,28 @@ class ChatService:
         )
         session_id = session["id"]
         route = self._resolve_route(body.message, body.task_type, body.route_override)
-        system_prompt, prompt_messages = self._build_prompt_context(
-            user_id=user_id, chat_id=session_id, route=route
-        )
-        add_message(self.db, session_id, "user", body.message)
-
         purpose = "deep" if route == "deep" else "realtime"
         selected = self._select_model_config(user_id=user_id, purpose=purpose)
+        compact_context = self._compact_prompt_context_for_model(
+            route=route,
+            selected_model=selected,
+            user_id=user_id,
+        )
+        if compact_context is None:
+            system_prompt, prompt_messages = self._build_prompt_context(
+                user_id=user_id, chat_id=session_id, route=route
+            )
+        else:
+            system_prompt, prompt_messages = compact_context
+        add_message(self.db, session_id, "user", body.message)
+
+        effective_system_prompt, effective_messages = _build_messages_for_model(
+            system_prompt=system_prompt,
+            context_messages=prompt_messages[1:],
+            user_message=body.message,
+            route=route,
+            selected_model=selected,
+        )
         _log_model_request(
             request_id=request_id,
             user_id=user_id,
@@ -393,12 +612,8 @@ class ChatService:
                 "model_name": selected["model_name"],
                 "api_key": selected.get("api_key"),
                 "endpoint": selected.get("endpoint"),
-                "system_prompt": system_prompt,
-                "messages": _build_alternating_messages(
-                    system_prompt=system_prompt,
-                    context_messages=prompt_messages[1:],
-                    user_message=body.message,
-                ),
+                "system_prompt": effective_system_prompt,
+                "messages": effective_messages,
             }
         )
         _log_model_response(
@@ -607,10 +822,25 @@ class ChatService:
                     content, task_type, event.get("route_override")
                 )
                 request_id = str(uuid4())
-                system_prompt, prompt_messages = self._build_prompt_context(
-                    user_id=user_id, chat_id=chat_session_id, route=route
+                compact_context = self._compact_prompt_context_for_model(
+                    route=route,
+                    selected_model=selected,
+                    user_id=user_id,
                 )
+                if compact_context is None:
+                    system_prompt, prompt_messages = self._build_prompt_context(
+                        user_id=user_id, chat_id=chat_session_id, route=route
+                    )
+                else:
+                    system_prompt, prompt_messages = compact_context
                 add_message(self.db, chat_session_id, "user", content)
+                effective_system_prompt, effective_messages = _build_messages_for_model(
+                    system_prompt=system_prompt,
+                    context_messages=prompt_messages[1:],
+                    user_message=content,
+                    route=route,
+                    selected_model=selected,
+                )
                 request_payload: dict[str, object] = {
                     "message": content,
                     "route": route,
@@ -620,12 +850,8 @@ class ChatService:
                     "model_name": str(selected["model_name"]),
                     "api_key": selected.get("api_key"),
                     "endpoint": selected.get("endpoint"),
-                    "system_prompt": system_prompt,
-                    "messages": _build_alternating_messages(
-                        system_prompt=system_prompt,
-                        context_messages=prompt_messages[1:],
-                        user_message=content,
-                    ),
+                    "system_prompt": effective_system_prompt,
+                    "messages": effective_messages,
                 }
                 request_payload["user_id"] = user_id
                 _log_model_request(
@@ -689,6 +915,7 @@ class ChatService:
             user_id,
             message[:200],
         )
+        setup_started = time.monotonic()
         if not user_id:
             yield f"event: error\ndata: {json.dumps({'content': 'missing user id'})}\n\n"
             return
@@ -710,15 +937,23 @@ class ChatService:
                 route,
                 session_id,
             )
-            system_prompt, prompt_messages = self._build_prompt_context(
-                user_id=user_id, chat_id=session_id, route=route
-            )
-            logger.info("[chat] stream context ready request_id=%s", request_id)
-            add_message(self.db, session_id, "user", message)
-
             purpose = "deep" if route == "deep" else "realtime"
             selected = self._select_model_config(user_id=user_id, purpose=purpose)
+            compact_context = self._compact_prompt_context_for_model(
+                route=route,
+                selected_model=selected,
+                user_id=user_id,
+            )
+            if compact_context is None:
+                system_prompt, prompt_messages = self._build_prompt_context(
+                    user_id=user_id, chat_id=session_id, route=route
+                )
+            else:
+                system_prompt, prompt_messages = compact_context
+            logger.info("[chat] stream context ready request_id=%s", request_id)
+            add_message(self.db, session_id, "user", message)
         except Exception as exc:
+            _rollback_failed_transaction(self.db)
             logger.exception("[chat] stream setup failed request_id=%s", request_id)
             yield f"event: error\ndata: {json.dumps({'request_id': request_id, 'content': f'stream setup failed: {exc}'})}\n\n"
             return
@@ -727,6 +962,13 @@ class ChatService:
             yield f"event: error\ndata: {json.dumps({'content': 'selected model does not support streaming'})}\n\n"
             return
 
+        effective_system_prompt, effective_messages = _build_messages_for_model(
+            system_prompt=system_prompt,
+            context_messages=prompt_messages[1:],
+            user_message=message,
+            route=route,
+            selected_model=selected,
+        )
         request_payload = {
             "message": message,
             "route": route,
@@ -737,12 +979,8 @@ class ChatService:
             "model_name": str(selected["model_name"]),
             "api_key": selected.get("api_key"),
             "endpoint": selected.get("endpoint"),
-            "system_prompt": system_prompt,
-            "messages": _build_alternating_messages(
-                system_prompt=system_prompt,
-                context_messages=prompt_messages[1:],
-                user_message=message,
-            ),
+            "system_prompt": effective_system_prompt,
+            "messages": effective_messages,
         }
         _log_model_request(
             request_id=request_id,
@@ -761,6 +999,7 @@ class ChatService:
             "provider_mode": selected["provider_mode"],
             "provider_name": selected["provider_name"],
             "model_name": selected["model_name"],
+            "setup_ms": int((time.monotonic() - setup_started) * 1000),
         }
         yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
 
@@ -815,6 +1054,7 @@ class ChatService:
         )
         if body.is_default:
             self._set_default_model_selection(user_id=user_id, default_model=result)
+        self._invalidate_realtime_cache(user_id)
         return result
 
     def list_model_configs(self, user_id: str) -> list[dict[str, str | bool | None]]:
@@ -846,6 +1086,7 @@ class ChatService:
             raise HTTPException(status_code=404, detail="model config not found")
         if body.is_default:
             self._set_default_model_selection(user_id=user_id, default_model=result)
+        self._invalidate_realtime_cache(user_id)
         return result
 
     def _set_default_model_selection(
@@ -889,6 +1130,7 @@ class ChatService:
         )
         if not deleted:
             raise HTTPException(status_code=404, detail="model config not found")
+        self._invalidate_realtime_cache(user_id)
         return {"id": model_config_id, "deleted": True}
 
     def set_model_selection(
@@ -911,12 +1153,14 @@ class ChatService:
                     status_code=400, detail="invalid deep_model_config_id"
                 )
 
-        return set_user_ai_selection(
+        result = set_user_ai_selection(
             self.db,
             user_id=user_id,
             realtime_model_config_id=body.realtime_model_config_id,
             deep_model_config_id=body.deep_model_config_id,
         )
+        self._invalidate_realtime_cache(user_id)
+        return result
 
     def get_model_selection(self, user_id: str) -> dict[str, str | None]:
         selection = get_user_ai_selection(self.db, user_id=user_id)
@@ -934,7 +1178,7 @@ class ChatService:
     def create_persona(
         self, user_id: str, body: PersonaUpsertRequest
     ) -> dict[str, object]:
-        return create_user_persona(
+        result = create_user_persona(
             self.db,
             user_id=user_id,
             name=body.name,
@@ -943,6 +1187,8 @@ class ChatService:
             tone=body.tone,
             alias=body.alias,
         )
+        self._invalidate_realtime_cache(user_id)
+        return result
 
     def update_persona(
         self, user_id: str, user_persona_id: str, body: PersonaUpsertRequest
@@ -959,6 +1205,7 @@ class ChatService:
         )
         if result is None:
             raise HTTPException(status_code=404, detail="persona not found")
+        self._invalidate_realtime_cache(user_id)
         return result
 
     def select_persona(
@@ -969,6 +1216,7 @@ class ChatService:
         )
         if result is None:
             raise HTTPException(status_code=404, detail="persona not found")
+        self._invalidate_realtime_cache(user_id)
         return result
 
     def list_memory(self, user_id: str, chat_id: str | None = None) -> list[dict[str, object]]:

@@ -106,6 +106,7 @@ def test_ollama_stream_tokens_uses_native_streaming(monkeypatch) -> None:
                 "model": "llama3.2",
                 "prompt": "System:\nBe fast.\n\nUser:\nhello",
                 "stream": True,
+                "think": False,
             },
             "headers": {
                 "Content-Type": "application/json",
@@ -152,6 +153,7 @@ def test_ollama_stream_tokens_uses_configured_chat_endpoint(monkeypatch) -> None
                     {"role": "user", "content": "hello"},
                 ],
                 "stream": True,
+                "think": False,
             },
             "headers": {
                 "Content-Type": "application/json",

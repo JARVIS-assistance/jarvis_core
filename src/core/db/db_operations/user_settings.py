@@ -207,6 +207,8 @@ def _normalize_terminal_profile(raw: dict[str, Any]) -> dict[str, Any]:
             if isinstance(env, dict)
             else {}
         ),
+        "allowed_commands": _string_list(raw.get("allowed_commands")),
+        "allowed_cwds": _string_list(raw.get("allowed_cwds")),
         "supports_pty": bool(raw.get("supports_pty", False)),
         "requires_confirm": bool(raw.get("requires_confirm", True)),
         "timeout_seconds": _positive_int(

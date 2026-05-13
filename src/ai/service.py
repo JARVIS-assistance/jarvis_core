@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from collections.abc import AsyncGenerator
 
 from .client import AIClient, LocalLLMAIClient, TokenAIClient
@@ -63,3 +64,17 @@ class AIService:
     ) -> None:
         client = self._choose_client(request["provider_mode"])
         await client.cancel_generation(realtime_session_id)
+
+    async def close(self) -> None:
+        seen: set[int] = set()
+        for client in (self.default_client, self.token_client, self.local_client):
+            marker = id(client)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            close = getattr(client, "close", None)
+            if not callable(close):
+                continue
+            result = close()
+            if inspect.isawaitable(result):
+                await result

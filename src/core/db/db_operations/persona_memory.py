@@ -502,7 +502,7 @@ def select_user_persona(
     now = now_iso()
     try:
         if db.backend == "postgres":
-            db.conn.execute(
+            cursor = db.conn.execute(
                 """
                 UPDATE chats
                 SET last_selected_user_persona_id = %s, last_message_at = %s
@@ -516,8 +516,18 @@ def select_user_persona(
                 """,
                 (user_persona_id, now, user_id),
             )
+            if cursor.rowcount == 0:
+                db.conn.execute(
+                    """
+                    INSERT INTO chats (
+                        id, user_id, status, last_selected_user_persona_id, created_at, last_message_at
+                    )
+                    VALUES (%s, %s, 'ACTIVE', %s, %s, %s)
+                    """,
+                    (str(uuid4()), user_id, user_persona_id, now, now),
+                )
         else:
-            db.conn.execute(
+            cursor = db.conn.execute(
                 """
                 UPDATE chats
                 SET last_selected_user_persona_id = ?, last_message_at = ?
@@ -531,6 +541,16 @@ def select_user_persona(
                 """,
                 (user_persona_id, now, user_id),
             )
+            if cursor.rowcount == 0:
+                db.conn.execute(
+                    """
+                    INSERT INTO chats (
+                        id, user_id, status, last_selected_user_persona_id, created_at, last_message_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (str(uuid4()), user_id, "ACTIVE", user_persona_id, now, now),
+                )
         db.conn.commit()
     except Exception:
         db.conn.rollback()

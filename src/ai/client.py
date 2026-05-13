@@ -18,6 +18,28 @@ from .schemas import AIRequest, AIResponse, AIStreamChunk
 logger = logging.getLogger(__name__)
 
 
+def _optional_int_env(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("invalid integer env %s=%r", name, raw)
+        return None
+
+
+def _optional_float_env(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("invalid float env %s=%r", name, raw)
+        return None
+
+
 class AIClient(Protocol):
     async def stream_chat(
         self, message: str, route: str, request_id: str
@@ -211,6 +233,43 @@ class LocalLLMAIClient(StubAIClient):
         "ollmahost",
     }
 
+    def __init__(self) -> None:
+        self._stream_session: aiohttp.ClientSession | None = None
+        self._stream_session_timeout_key: (
+            tuple[float | None, float | None, float | None] | None
+        ) = None
+
+    @staticmethod
+    def _timeout_key(
+        timeout: aiohttp.ClientTimeout,
+    ) -> tuple[float | None, float | None, float | None]:
+        return timeout.total, timeout.connect, timeout.sock_read
+
+    async def _session_for_timeout(
+        self,
+        timeout: aiohttp.ClientTimeout,
+    ) -> aiohttp.ClientSession:
+        key = self._timeout_key(timeout)
+        session = self._stream_session
+        if (
+            session is not None
+            and not getattr(session, "closed", False)
+            and self._stream_session_timeout_key == key
+        ):
+            return session
+        if session is not None and not getattr(session, "closed", False):
+            await session.close()
+        self._stream_session = aiohttp.ClientSession(timeout=timeout)
+        self._stream_session_timeout_key = key
+        return self._stream_session
+
+    async def close(self) -> None:
+        session = self._stream_session
+        if session is not None and not getattr(session, "closed", False):
+            await session.close()
+        self._stream_session = None
+        self._stream_session_timeout_key = None
+
     @staticmethod
     def _build_messages(request: AIRequest) -> list[dict[str, str]]:
         if request.get("messages"):
@@ -299,6 +358,86 @@ class LocalLLMAIClient(StubAIClient):
         return None
 
     @staticmethod
+    def _ollama_options_for_request(request: AIRequest) -> dict[str, Any]:
+        route = str(request.get("route") or "realtime").upper()
+        route_prefix = f"JARVIS_OLLAMA_{route}_"
+        generic_prefix = "JARVIS_OLLAMA_"
+        option_envs: tuple[tuple[str, str, str], ...] = (
+            ("num_predict", "NUM_PREDICT", "int"),
+            ("num_ctx", "NUM_CTX", "int"),
+            ("num_thread", "NUM_THREAD", "int"),
+            ("num_gpu", "NUM_GPU", "int"),
+            ("temperature", "TEMPERATURE", "float"),
+            ("top_p", "TOP_P", "float"),
+            ("top_k", "TOP_K", "int"),
+            ("repeat_penalty", "REPEAT_PENALTY", "float"),
+        )
+        options: dict[str, Any] = {}
+        for option_name, env_suffix, kind in option_envs:
+            route_env = f"{route_prefix}{env_suffix}"
+            generic_env = f"{generic_prefix}{env_suffix}"
+            value = (
+                _optional_int_env(route_env)
+                if kind == "int"
+                else _optional_float_env(route_env)
+            )
+            if value is None:
+                value = (
+                    _optional_int_env(generic_env)
+                    if kind == "int"
+                    else _optional_float_env(generic_env)
+                )
+            if value is not None:
+                options[option_name] = value
+        return options
+
+    @staticmethod
+    def _apply_ollama_runtime_options(
+        payload: dict[str, Any],
+        request: AIRequest,
+    ) -> None:
+        options = LocalLLMAIClient._ollama_options_for_request(request)
+        if options:
+            payload["options"] = options
+        route = str(request.get("route") or "realtime").upper()
+        keep_alive = (
+            os.getenv(f"JARVIS_OLLAMA_{route}_KEEP_ALIVE")
+            or os.getenv("JARVIS_OLLAMA_KEEP_ALIVE")
+        )
+        if keep_alive:
+            payload["keep_alive"] = keep_alive
+        think = os.getenv(
+            f"JARVIS_OLLAMA_{route}_THINK",
+            os.getenv("JARVIS_OLLAMA_THINK", "false" if route == "REALTIME" else ""),
+        )
+        if think.strip():
+            payload["think"] = think.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _ollama_timeout_for_request(request: AIRequest) -> aiohttp.ClientTimeout:
+        route = str(request.get("route") or "realtime").upper()
+        total = (
+            _optional_float_env(f"JARVIS_OLLAMA_{route}_STREAM_TOTAL_TIMEOUT")
+            or _optional_float_env("JARVIS_OLLAMA_STREAM_TOTAL_TIMEOUT")
+            or (18.0 if route == "REALTIME" else 120.0)
+        )
+        connect = (
+            _optional_float_env(f"JARVIS_OLLAMA_{route}_STREAM_CONNECT_TIMEOUT")
+            or _optional_float_env("JARVIS_OLLAMA_STREAM_CONNECT_TIMEOUT")
+            or 5.0
+        )
+        sock_read = (
+            _optional_float_env(f"JARVIS_OLLAMA_{route}_STREAM_READ_TIMEOUT")
+            or _optional_float_env("JARVIS_OLLAMA_STREAM_READ_TIMEOUT")
+            or (4.0 if route == "REALTIME" else None)
+        )
+        return aiohttp.ClientTimeout(
+            total=max(total, 1.0),
+            connect=max(connect, 0.5),
+            sock_read=max(sock_read, 0.5) if sock_read is not None else None,
+        )
+
+    @staticmethod
     def _post_json(
         url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int = 120
     ) -> dict[str, Any]:
@@ -338,6 +477,7 @@ class LocalLLMAIClient(StubAIClient):
                 "prompt": self._build_prompt_text(request),
                 "stream": False,
             }
+        self._apply_ollama_runtime_options(payload, request)
         try:
             data = self._post_json(
                 endpoint,
@@ -427,34 +567,34 @@ class LocalLLMAIClient(StubAIClient):
         }
         logger.info("[AI-SSE-REQUEST] POST %s", endpoint)
 
-        timeout = aiohttp.ClientTimeout(total=120, connect=10)
+        timeout = self._ollama_timeout_for_request(request)
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(endpoint, json=payload, headers=headers) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.error("[AI-SSE-ERROR] status=%s body=%s", resp.status, body[:300])
-                        yield f"[provider-error] HTTP {resp.status}"
-                        return
+            session = await self._session_for_timeout(timeout)
+            async with session.post(endpoint, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.error("[AI-SSE-ERROR] status=%s body=%s", resp.status, body[:300])
+                    yield f"[provider-error] HTTP {resp.status}"
+                    return
 
-                    count = 0
-                    async for raw_line in resp.content:
-                        line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
-                        if not line.startswith("data: "):
-                            continue
-                        data_str = line[len("data: "):]
-                        if data_str.strip() == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data_str)
-                            delta = chunk.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content")
-                            if content:
-                                count += 1
-                                yield content
-                        except (json.JSONDecodeError, IndexError, KeyError):
-                            continue
-                    logger.info("[AI-SSE-RESPONSE] streamed %d tokens", count)
+                count = 0
+                async for raw_line in resp.content:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[len("data: "):]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content")
+                        if content:
+                            count += 1
+                            yield content
+                    except (json.JSONDecodeError, IndexError, KeyError):
+                        continue
+                logger.info("[AI-SSE-RESPONSE] streamed %d tokens", count)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.error("[AI-SSE-ERROR] %s", exc)
             yield f"[provider-error] {exc}"
@@ -481,6 +621,7 @@ class LocalLLMAIClient(StubAIClient):
                 "prompt": self._build_prompt_text(request),
                 "stream": True,
             }
+        self._apply_ollama_runtime_options(payload, request)
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/x-ndjson",
@@ -491,53 +632,53 @@ class LocalLLMAIClient(StubAIClient):
         if fallback is not None:
             endpoints.append(fallback)
 
-        timeout = aiohttp.ClientTimeout(total=120, connect=10)
+        timeout = self._ollama_timeout_for_request(request)
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                for candidate_endpoint in endpoints:
-                    logger.info("[AI-OLLAMA-STREAM-REQUEST] POST %s", candidate_endpoint)
-                    async with session.post(
-                        candidate_endpoint, json=payload, headers=headers
-                    ) as resp:
-                        if resp.status == 404 and candidate_endpoint != endpoints[-1]:
-                            body = await resp.text()
-                            logger.info(
-                                "[AI-OLLAMA-STREAM-FALLBACK] status=404 endpoint=%s body=%s",
-                                candidate_endpoint,
-                                body[:300],
-                            )
-                            continue
+            session = await self._session_for_timeout(timeout)
+            for candidate_endpoint in endpoints:
+                logger.info("[AI-OLLAMA-STREAM-REQUEST] POST %s", candidate_endpoint)
+                async with session.post(
+                    candidate_endpoint, json=payload, headers=headers
+                ) as resp:
+                    if resp.status == 404 and candidate_endpoint != endpoints[-1]:
+                        body = await resp.text()
+                        logger.info(
+                            "[AI-OLLAMA-STREAM-FALLBACK] status=404 endpoint=%s body=%s",
+                            candidate_endpoint,
+                            body[:300],
+                        )
+                        continue
 
-                        if resp.status != 200:
-                            body = await resp.text()
-                            logger.error(
-                                "[AI-OLLAMA-STREAM-ERROR] status=%s body=%s",
-                                resp.status,
-                                body[:300],
-                            )
-                            yield f"[provider-error] HTTP {resp.status}"
-                            return
-
-                        count = 0
-                        async for raw_line in resp.content:
-                            line = raw_line.decode("utf-8", errors="replace").strip()
-                            if not line:
-                                continue
-                            try:
-                                chunk = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            if endpoint_type == "chat":
-                                token = chunk.get("message", {}).get("content")
-                            else:
-                                token = chunk.get("response")
-                            if isinstance(token, str) and token:
-                                count += 1
-                                yield token
-                            if chunk.get("done") is True:
-                                break
-                        logger.info("[AI-OLLAMA-STREAM-RESPONSE] streamed %d tokens", count)
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error(
+                            "[AI-OLLAMA-STREAM-ERROR] status=%s body=%s",
+                            resp.status,
+                            body[:300],
+                        )
+                        yield f"[provider-error] HTTP {resp.status}"
                         return
+
+                    count = 0
+                    async for raw_line in resp.content:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if endpoint_type == "chat":
+                            token = chunk.get("message", {}).get("content")
+                        else:
+                            token = chunk.get("response")
+                        if isinstance(token, str) and token:
+                            count += 1
+                            yield token
+                        if chunk.get("done") is True:
+                            break
+                    logger.info("[AI-OLLAMA-STREAM-RESPONSE] streamed %d tokens", count)
+                    return
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.error("[AI-OLLAMA-STREAM-ERROR] %s", exc)
             yield f"[provider-error] {exc}"
